@@ -2525,6 +2525,25 @@ void DivEngine::registerSystems() {
     }
   );
 
+  sysDefs[DIV_SYSTEM_BR1611]=new DivSysDef(
+    _("BR1611 (Ompreza 2)"), NULL, 0x1611, 0, 7, 7, 7,
+    false, true, 0, false, (1U<<DIV_SAMPLE_DEPTH_16BIT)|(1U<<DIV_SAMPLE_DEPTH_8BIT)|(1U<<DIV_SAMPLE_DEPTH_4BIT)|(1U<<DIV_SAMPLE_DEPTH_BRR), 256, 256,
+    _("the sound chip of the fictional Ompreza 2 console (1989), designed by Evolution BR811. 7 channels of WMS (Wave Modulation Synthesis): 4 summed operators per channel, each with its own waveform and OPN-style envelope. channels 6 and 7 can also play 16-bit, 8-bit, 4-bit or CP (BRR-style ADPCM) samples from cartridge ROM."),
+    DivChanDefFunc({
+      DivChanDef(_("Channel 1"), "W1", DIV_CH_FM, DIV_INS_BR1611),
+      DivChanDef(_("Channel 2"), "W2", DIV_CH_FM, DIV_INS_BR1611),
+      DivChanDef(_("Channel 3"), "W3", DIV_CH_FM, DIV_INS_BR1611),
+      DivChanDef(_("Channel 4"), "W4", DIV_CH_FM, DIV_INS_BR1611),
+      DivChanDef(_("Channel 5"), "W5", DIV_CH_FM, DIV_INS_BR1611),
+      DivChanDef(_("Channel 6"), "W6", DIV_CH_PCM, DIV_INS_BR1611, DIV_INS_AMIGA),
+      DivChanDef(_("Channel 7"), "W7", DIV_CH_PCM, DIV_INS_BR1611, DIV_INS_AMIGA)
+    }),
+    {
+      {0x10, {DIV_CMD_FM_LFO, _("10xx: Set LFO (0: off; 1-8: on, speed 3.98, 5.56, 6.02, 6.37, 6.88, 9.63, 48.1 or 72.2 Hz)")}},
+      {0x11, {DIV_CMD_FM_FMS, _("11xx: Set vibrato depth (FMS, 0 to 7)")}}
+    }
+  );
+
   sysDefs[DIV_SYSTEM_PV1000]=new DivSysDef(
     _("Casio PV-1000"), NULL, 0xcb, 0, 3, 3, 3,
     false, true, 0, false, 0, 0, 0,

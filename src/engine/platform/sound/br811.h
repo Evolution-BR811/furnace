@@ -18,6 +18,7 @@ constexpr int     NUM_CHANNELS  = 5;
 constexpr int     DIVISOR       = 57;         // divisor de afinacao (era 114: dobra a resolucao da afinacao)
 constexpr int     MAX_PERIOD    = 4095;       // periodo de 12 bits
 constexpr int     VOLUME_MAX    = 15;         // volume de 0 a 15
+constexpr int     PCM_VOLUME_MAX = 30;        // PCM (canal 5) com o chip de cartucho PCM Volume Plus: volume de 0 a 30
 
 constexpr int     WAVE_A_STEPS  = 8;
 constexpr int     WAVE_B_STEPS  = 16;
@@ -35,7 +36,10 @@ constexpr int64_t UNITS_PER_CLOCK = 1024;
 // Registradores (rascunho do mapa de registradores, secao 8 da especificacao)
 //
 // Cada canal tem 3 registradores:
-//   reg 0: bits 7-6 modo | bits 5-4 livres | bits 3-0 volume
+//   reg 0: bits 7-6 modo | bit 5 livre | bits 4-0 volume
+//          (so o canal 5 em modo PCM COM o chip PCM Volume Plus usa os 5 bits,
+//           volume 0-30; nos demais casos vale so bits 3-0, volume 0-15, e o
+//           bit 4 e ignorado)
 //   reg 1: periodo, 8 bits baixos
 //   reg 2: bit 7 livre | bits 6-4 taxa de ruido | bits 3-0 periodo, 4 bits altos
 //
@@ -88,6 +92,10 @@ public:
     // Muda a taxa de saida (usado pelo Furnace: clock / 57).
     void setSampleRate(double sampleRate);
     void setRomReader(RomReader reader) { rom_ = std::move(reader); }
+    // Chip de cartucho "PCM Volume Plus": libera o volume 0-30 no PCM do canal 5.
+    // Sem ele (padrao), o PCM tem volume 0-15 como os outros canais.
+    void setPcmVolumePlus(bool present) { pcmVolumePlus_ = present; }
+    bool pcmVolumePlus() const { return pcmVolumePlus_; }
 
     // Escrita nos registradores de um canal (channel 0..4, reg 0..2).
     void write(int channel, int reg, uint8_t value);
@@ -147,6 +155,7 @@ private:
     Channel  ch_[NUM_CHANNELS];
     Pcm      pcm_;
     RomReader rom_;
+    bool      pcmVolumePlus_ = false;
 };
 
 }  // namespace br811

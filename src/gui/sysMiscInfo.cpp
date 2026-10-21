@@ -406,6 +406,9 @@ void FurnaceGUI::drawSystemChannelInfoText(const DivSysDef* whichDef) {
       case DIV_INS_ADPCMB:
         chanCount[CHANNEL_TYPE_SAMPLE]++;
         break;
+      case DIV_INS_BR1611:
+        chanCount[chanDef.type]++;
+        break;
       case DIV_INS_VRC6_SAW:
         chanCount[CHANNEL_TYPE_SAW]++;
         break;

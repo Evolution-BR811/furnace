@@ -33,8 +33,8 @@ class DivPlatformBR811: public DivDispatch {
     bool dirty;     // precisa reescrever os registradores do chip
     bool pcm;       // canal 5: o instrumento atual e um sample (PCM)
     int sample;     // canal 5: numero do sample em uso
-    Channel(bool linear=true):
-      SharedChannel(15,linear),
+    Channel(bool linear=true, int initVol=15):
+      SharedChannel(initVol,linear),
       source(0),
       period(0),
       dirty(true),
@@ -57,6 +57,8 @@ class DivPlatformBR811: public DivDispatch {
   bool* sampleLoaded;
   DivMemoryComposition memCompo;
   bool pcmActive;
+  bool pcmVolumePlus; // chip de cartucho PCM Volume Plus presente (PCM com volume 0-30)
+  int pcmMaxVol() { return pcmVolumePlus?30:15; }
 
   void commit(int ch);
   void chipWrite(int ch, int reg, unsigned char val);

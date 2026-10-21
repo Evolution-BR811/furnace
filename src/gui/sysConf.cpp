@@ -1223,6 +1223,26 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
       }
       break;
     }
+    case DIV_SYSTEM_BR811: {
+      bool pcmVolumePlus=flags.getBool("pcmVolumePlus",false);
+
+      if (ImGui::Checkbox(_("PCM Volume Plus (fictional cartridge chip)"),&pcmVolumePlus)) {
+        altered=true;
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(_("a fictional data path chip in the cartridge. it raises the PCM volume range of channel 5 from 0-15 to 0-30."));
+      }
+
+      if (altered) {
+        e->lockSave([&]() {
+          flags.set("pcmVolumePlus",pcmVolumePlus);
+        });
+      }
+
+      // o clock do BR811 e fixo (o da CPU RS04)
+      supportsCustomRate=false;
+      break;
+    }
     case DIV_SYSTEM_QSOUND: {
       int echoDelay=flags.getInt("echoDelay",0);
       int echoFeedback=flags.getInt("echoFeedback",0)&255;

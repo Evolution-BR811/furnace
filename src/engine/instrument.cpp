@@ -870,6 +870,21 @@ bool DivInstrumentPowerNoise::operator==(const DivInstrumentPowerNoise& other) {
   return _C(octave);
 }
 
+bool DivInstrumentBR1611::operator==(const DivInstrumentBR1611& other) {
+  return (
+    _C(wave[0]) &&
+    _C(wave[1]) &&
+    _C(wave[2]) &&
+    _C(wave[3]) &&
+    _C(pcmAR) &&
+    _C(pcmD1R) &&
+    _C(pcmSL) &&
+    _C(pcmD2R) &&
+    _C(pcmRR) &&
+    _C(pcmTL)
+  );
+}
+
 bool DivInstrumentSID2::operator==(const DivInstrumentSID2& other) {
   return (
     _C(volume) &&
@@ -1647,6 +1662,23 @@ void DivInstrument::writeFeaturePN(SafeWriter* w) {
   FEATURE_END;
 }
 
+void DivInstrument::writeFeatureBW(SafeWriter* w) {
+  FEATURE_BEGIN("BW");
+
+  for (int i=0; i<4; i++) {
+    w->writeC(br1611.wave[i]);
+  }
+  // envelope do PCM
+  w->writeC(br1611.pcmAR);
+  w->writeC(br1611.pcmD1R);
+  w->writeC(br1611.pcmSL);
+  w->writeC(br1611.pcmD2R);
+  w->writeC(br1611.pcmRR);
+  w->writeC(br1611.pcmTL);
+
+  FEATURE_END;
+}
+
 void DivInstrument::writeFeatureS2(SafeWriter* w) {
   FEATURE_BEGIN("S2");
 
@@ -1791,6 +1823,7 @@ void DivInstrument::putInsData2(SafeWriter* w, bool fui, const DivSong* song, bo
   bool featureNE=false;
   bool featureEF=false;
   bool featurePN=false;
+  bool featureBW=false;
   bool featureS2=false;
   bool featureS3=false;
   bool featureKT=false;
@@ -2057,6 +2090,12 @@ void DivInstrument::putInsData2(SafeWriter* w, bool fui, const DivSong* song, bo
         featureSM=true;
         if (amiga.useSample) featureSL=true;
         break;
+      case DIV_INS_BR1611:
+        featureFM=true;
+        featureBW=true;
+        featureSM=true;
+        if (amiga.useSample) featureSL=true;
+        break;
       case DIV_INS_MAX:
         break;
       case DIV_INS_NULL:
@@ -2109,6 +2148,9 @@ void DivInstrument::putInsData2(SafeWriter* w, bool fui, const DivSong* song, bo
     }
     if (powernoise!=defaultIns.powernoise) {
       featurePN=true;
+    }
+    if (br1611!=defaultIns.br1611) {
+      featureBW=true;
     }
     if (sid2!=defaultIns.sid2) {
       featureS2=true;
@@ -2268,6 +2310,9 @@ void DivInstrument::putInsData2(SafeWriter* w, bool fui, const DivSong* song, bo
   }
   if (featurePN) {
     writeFeaturePN(w);
+  }
+  if (featureBW) {
+    writeFeatureBW(w);
   }
   if (featureS2) {
     writeFeatureS2(w);
@@ -3301,6 +3346,25 @@ void DivInstrument::readFeaturePN(SafeReader& reader, short version) {
   READ_FEAT_END;
 }
 
+void DivInstrument::readFeatureBW(SafeReader& reader, short version) {
+  READ_FEAT_BEGIN;
+
+  for (int i=0; i<4; i++) {
+    br1611.wave[i]=reader.readC();
+  }
+  // envelope do PCM (ausente em arquivos de teste antigos: mantem o padrao)
+  if (reader.tell()+6<=endOfFeat) {
+    br1611.pcmAR=reader.readC();
+    br1611.pcmD1R=reader.readC();
+    br1611.pcmSL=reader.readC();
+    br1611.pcmD2R=reader.readC();
+    br1611.pcmRR=reader.readC();
+    br1611.pcmTL=reader.readC();
+  }
+
+  READ_FEAT_END;
+}
+
 void DivInstrument::readFeatureS2(SafeReader& reader, short version) {
   READ_FEAT_BEGIN;
 
@@ -3482,6 +3546,8 @@ DivDataErrors DivInstrument::readInsDataNew(SafeReader& reader, short version, b
       readFeatureEF(reader,version);
     } else if (memcmp(featCode,"PN",2)==0) { // PowerNoise
       readFeaturePN(reader,version);
+    } else if (memcmp(featCode,"BW",2)==0) { // BR1611 waves
+      readFeatureBW(reader,version);
     } else if (memcmp(featCode,"S2",2)==0) { // SID2
       readFeatureS2(reader,version);
     } else if (memcmp(featCode,"S3",2)==0) { // SID3

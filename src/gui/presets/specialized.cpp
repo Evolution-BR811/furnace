@@ -152,9 +152,48 @@ void initSystemPresetsSpecialized(std::vector<FurnaceGUISysCategory>& sysCategor
     }
   );
   ENTRY(
-    _("Ompreza (fictional, BR811)"), {
+    _("Ompreza (fictional)"), {}
+  );
+    SUB_ENTRY(
+      _("Ompreza (BR811)"), {
+        CH(DIV_SYSTEM_BR811, 1.0f, 0, "")
+      }
+    );
+    SUB_ENTRY(
+      _("Ompreza + PCM Volume Plus (BR811 with the fictional cartridge chip)"), {
+        CH(DIV_SYSTEM_BR811, 1.0f, 0, "pcmVolumePlus=true")
+      }
+    );
+  ENTRY(
+    _("Ompreza 2 (fictional, BR811 + BR1611)"), {
+      CH(DIV_SYSTEM_BR1611, 1.0f, 0, ""),
       CH(DIV_SYSTEM_BR811, 1.0f, 0, "")
     }
   );
+    SUB_ENTRY(
+      _("Ompreza 2 + PCM Volume Plus (BR811 + BR1611, with the fictional cartridge chip)"), {
+        CH(DIV_SYSTEM_BR1611, 1.0f, 0, ""),
+        CH(DIV_SYSTEM_BR811, 1.0f, 0, "pcmVolumePlus=true")
+      }
+    );
+    SUB_ENTRY(
+      _("Ompreza 2 (BR1611 only)"), {
+        CH(DIV_SYSTEM_BR1611, 1.0f, 0, "")
+      }
+    );
+    SUB_ENTRY(
+      _("Ompreza 2 + Sound Expander (BR811 + BR1611 + Paula)"), {
+        CH(DIV_SYSTEM_BR1611, 1.0f, 0, ""),
+        CH(DIV_SYSTEM_BR811, 1.0f, 0, ""),
+        CH(DIV_SYSTEM_AMIGA, 1.0f, 0, "")
+      }
+    );
+    SUB_ENTRY(
+      _("Ompreza 2 + Sound Expander + PCM Volume Plus (BR811 + BR1611 + Paula)"), {
+        CH(DIV_SYSTEM_BR1611, 1.0f, 0, ""),
+        CH(DIV_SYSTEM_BR811, 1.0f, 0, "pcmVolumePlus=true"),
+        CH(DIV_SYSTEM_AMIGA, 1.0f, 0, "")
+      }
+    );
   CATEGORY_END;
 }

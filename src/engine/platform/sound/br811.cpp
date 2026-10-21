@@ -143,7 +143,11 @@ void Chip::write(int channel, int reg, uint8_t value) {
     switch (reg) {
         case 0: {
             const uint8_t newMode = (value >> 6) & 3;
-            c.volume = value & 0x0F;
+            // volume de 4 bits (0-15); o PCM do canal 5 usa 5 bits (0-30) quando
+            // o chip de cartucho PCM Volume Plus esta presente
+            c.volume = (pcmVolumePlus_ && newMode == MODE_PCM && channel == PCM_CHANNEL)
+                           ? static_cast<uint8_t>(std::min<int>(value & 0x1F, PCM_VOLUME_MAX))
+                           : static_cast<uint8_t>(value & 0x0F);
             if (newMode != c.mode) {
                 c.mode = newMode;
                 c.step = 0;
@@ -212,10 +216,12 @@ void Chip::render(float* out, int numSamples, float* const* perChannel) {
         for (int c = 0; c < NUM_CHANNELS; c++) {
             const double v = runChannel(ch_[c], c, dt) / static_cast<double>(dt);
             mix += v;
-            if (perChannel) perChannel[c][i] = static_cast<float>(v / CHANNEL_MAX);
+            // o PCM com volume acima de 15 passa de 1,0; limita para o osciloscopio
+            if (perChannel) perChannel[c][i] = static_cast<float>(std::min(v / CHANNEL_MAX, 1.99));
         }
         totalUnits_ += dt;
-        out[i] = static_cast<float>(mix / (NUM_CHANNELS * CHANNEL_MAX));
+        // satura em 1,0 (o PCM com volume acima de 15 pode passar da escala)
+        out[i] = static_cast<float>(std::min(mix / (NUM_CHANNELS * CHANNEL_MAX), 1.0));
     }
 }
 

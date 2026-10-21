@@ -103,6 +103,7 @@ enum DivInstrumentType: unsigned short {
   DIV_INS_SID3=66,
   DIV_INS_KLATTSCH=67,
   DIV_INS_BR811=68,
+  DIV_INS_BR1611=69,
   DIV_INS_MAX,
   DIV_INS_NULL
 };
@@ -918,6 +919,30 @@ struct DivInstrumentPowerNoise {
     octave(0) {}
 };
 
+// BR1611 (Ompreza 2): a onda (wavetable da musica) de cada um dos 4 operadores da WMS
+// e o envelope proprio do PCM (canais 6 e 7), separado do envelope dos operadores
+struct DivInstrumentBR1611 {
+  unsigned char wave[4];
+  unsigned char pcmAR, pcmD1R, pcmSL, pcmD2R, pcmRR, pcmTL;
+
+  bool operator==(const DivInstrumentBR1611& other);
+  bool operator!=(const DivInstrumentBR1611& other) {
+    return !(*this==other);
+  }
+  DivInstrumentBR1611():
+    pcmAR(31),
+    pcmD1R(0),
+    pcmSL(0),
+    pcmD2R(0),
+    pcmRR(15),
+    pcmTL(0) {
+    wave[0]=0;
+    wave[1]=0;
+    wave[2]=0;
+    wave[3]=0;
+  }
+};
+
 struct DivInstrumentSID2 {
   unsigned char volume;
   unsigned char mixMode;
@@ -1088,6 +1113,7 @@ struct DivInstrumentPOD {
   DivInstrumentSID2 sid2;
   DivInstrumentSID3 sid3;
   DivInstrumentKlattsch klattsch;
+  DivInstrumentBR1611 br1611;
 
   DivInstrumentPOD() :
     type(DIV_INS_FM) {
@@ -1201,6 +1227,7 @@ struct DivInstrument: DivInstrumentPOD {
   void writeFeatureNE(SafeWriter* w);
   void writeFeatureEF(SafeWriter* w);
   void writeFeaturePN(SafeWriter* w);
+  void writeFeatureBW(SafeWriter* w);
   void writeFeatureS2(SafeWriter* w);
   void writeFeatureS3(SafeWriter* w);
   void writeFeatureKT(SafeWriter* w);
@@ -1228,6 +1255,7 @@ struct DivInstrument: DivInstrumentPOD {
   void readFeatureNE(SafeReader& reader, short version);
   void readFeatureEF(SafeReader& reader, short version);
   void readFeaturePN(SafeReader& reader, short version);
+  void readFeatureBW(SafeReader& reader, short version);
   void readFeatureS2(SafeReader& reader, short version);
   void readFeatureS3(SafeReader& reader, short version);
   void readFeatureKT(SafeReader& reader, short version);

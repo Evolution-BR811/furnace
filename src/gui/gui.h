@@ -394,6 +394,7 @@ enum FurnaceGUIColors {
   GUI_COLOR_INSTR_SID3,
   GUI_COLOR_INSTR_KLATTSCH,
   GUI_COLOR_INSTR_BR811,
+  GUI_COLOR_INSTR_BR1611,
   GUI_COLOR_INSTR_UNKNOWN,
 
   GUI_COLOR_CHANNEL_BG,
@@ -3268,6 +3269,8 @@ class FurnaceGUI {
   void insEditSM8521(DivInstrument* ins);
   void insEditPV1000(DivInstrument* ins);
   void insEditBR811(DivInstrument* ins);
+  void insEditBR1611(DivInstrument* ins);
+  void insEditBR1611PCMEnv(DivInstrument* ins);
   void insEditK053260(DivInstrument* ins);
   void insEditYMF292(DivInstrument* ins);
   void insEditTED(DivInstrument* ins);

@@ -99,7 +99,9 @@ void DivPlatformBR811::commit(int ch) {
   if (ch==4 && !chan[ch].pcm && pcmActive) pcmStop();
   int vol=(chan[ch].active && !isMuted[ch])?chan[ch].outVol:0;
   if (vol<0) vol=0;
-  if (vol>15) vol=15;
+  // volume 0-15; so o PCM do canal 5 chega a 30 (chip de cartucho)
+  int maxVol=(ch==4 && mode==br811::MODE_PCM)?pcmMaxVol():15;
+  if (vol>maxVol) vol=maxVol;
   int period=chan[ch].period;
   if (period<0) period=0;
   if (period>4095) period=4095;
@@ -143,7 +145,8 @@ void DivPlatformBR811::tick(bool sysTick) {
   for (int i=0; i<5; i++) {
     chan[i].std.next();
     if (chan[i].std.vol.had) {
-      chan[i].outVol=VOL_SCALE_LINEAR(chan[i].vol&15,MIN(15,chan[i].std.vol.val),15);
+      int volRange=(i==4)?pcmMaxVol():15;
+      chan[i].outVol=VOL_SCALE_LINEAR(chan[i].vol&31,MIN(volRange,chan[i].std.vol.val),volRange);
       chan[i].dirty=true;
     }
     if (NEW_ARP_STRAT) {
@@ -288,7 +291,7 @@ int DivPlatformBR811::dispatch(DivCommand c) {
       chan[c.chan].inPorta=c.value;
       break;
     case DIV_CMD_GET_VOLMAX:
-      return 15;
+      return (c.chan==4)?pcmMaxVol():15;
       break;
     case DIV_CMD_MACRO_OFF:
       chan[c.chan].std.mask(c.value,true);
@@ -347,7 +350,8 @@ void DivPlatformBR811::reset() {
   chip.reset();
   pcmActive=false;
   for (int i=0; i<5; i++) {
-    chan[i]=Channel(parent->song.compatFlags.linearPitch);
+    // o canal 5 (PCM) tem volume maximo 30; os demais, 15
+    chan[i]=Channel(parent->song.compatFlags.linearPitch,(i==4)?pcmMaxVol():15);
     chan[i].pitchTable=&pitchTable;
     chan[i].std.setEngine(parent);
   }
@@ -379,6 +383,8 @@ unsigned int DivPlatformBR811::getMaxFreq(int ch) {
 void DivPlatformBR811::setFlags(const DivConfig& flags) {
   // o clock do BR811 e fixo: o mesmo da CPU RS04 do Ompreza (6,42 MHz)
   chipClock=BR811_CLOCK;
+  pcmVolumePlus=flags.getBool("pcmVolumePlus",false);
+  chip.setPcmVolumePlus(pcmVolumePlus);
   rate=chipClock/RATE_DIVIDER;
   chip.setSampleRate(rate);
   for (int i=0; i<5; i++) {
@@ -403,6 +409,7 @@ void DivPlatformBR811::poke(std::vector<DivRegWrite>& wlist) {
 
 int DivPlatformBR811::init(DivEngine* p, int channels, int sugRate, const DivConfig& flags) {
   parent=p;
+  pcmVolumePlus=false;
   dumpWrites=false;
   skipRegisterWrites=false;
   for (int i=0; i<5; i++) {

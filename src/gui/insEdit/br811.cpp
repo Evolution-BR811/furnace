@@ -23,7 +23,7 @@ void FurnaceGUI::insEditBR811(DivInstrument* ins) {
   insTabSample(ins);
 
   if (ImGui::BeginTabItem(_("Macros"))) {
-    macroList.push_back(FurnaceGUIMacroDesc(_("Volume"),&ins->std.volMacro,0,15,160,uiColors[GUI_COLOR_MACRO_VOLUME]));
+    macroList.push_back(FurnaceGUIMacroDesc(_("Volume"),&ins->std.volMacro,0,30,160,uiColors[GUI_COLOR_MACRO_VOLUME]));
     macroList.push_back(FurnaceGUIMacroDesc(_("Arpeggio"),&ins->std.arpMacro,-120,120,160,uiColors[GUI_COLOR_MACRO_PITCH],true,NULL,macroHoverNote,false,NULL,true,ins->std.arpMacro.val));
     macroList.push_back(FurnaceGUIMacroDesc(_("Waveform"),&ins->std.dutyMacro,0,7,160,uiColors[GUI_COLOR_MACRO_WAVE],false,NULL,br811WaveformName));
     macroList.push_back(FurnaceGUIMacroDesc(_("Pitch"),&ins->std.pitchMacro,-2048,2047,160,uiColors[GUI_COLOR_MACRO_PITCH],true,macroRelativeMode));
