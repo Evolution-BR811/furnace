@@ -395,6 +395,7 @@ enum FurnaceGUIColors {
   GUI_COLOR_INSTR_KLATTSCH,
   GUI_COLOR_INSTR_BR811,
   GUI_COLOR_INSTR_BR1611,
+  GUI_COLOR_INSTR_BR411,
   GUI_COLOR_INSTR_UNKNOWN,
 
   GUI_COLOR_CHANNEL_BG,
@@ -692,6 +693,8 @@ enum FurnaceGUIFileDialogs {
   GUI_FILE_WAVE_SAVE_DMW,
   GUI_FILE_WAVE_SAVE_RAW,
   GUI_FILE_WAVE_SAVE_ALL,
+  GUI_FILE_BR1611_WAVE_OPEN,
+  GUI_FILE_BR1611_WAVE_SAVE,
   GUI_FILE_SAMPLE_OPEN,
   GUI_FILE_SAMPLE_OPEN_RAW,
   GUI_FILE_SAMPLE_OPEN_REPLACE,
@@ -1834,6 +1837,14 @@ class FurnaceGUI {
   bool portrait, injectBackUp, mobileMenuOpen, warnColorPushed;
   bool wantCaptureKeyboard, oldWantCaptureKeyboard, displayMacroMenu;
   bool displayNew, displayExport, displayPalette, fullScreen, sysFullScreen, preserveChanPos, sysDupCloneChannels, sysDupEnd;
+  // ajuste automatico de volume na troca de chip (icone no Chip Manager)
+  bool sysAutoVolume=true, sysAutoVolumeLoaded=false;
+  // BR1611: editor da onda de um operador
+  int br1611WaveIns=-1, br1611WaveOp=0, br1611WaveFrom=0;
+  bool br1611WaveDrawing=false, br1611WaveHex=false;
+  int br1611WaveLastX=-1, br1611WaveLastY=0;
+  String br1611WaveText;
+  void br1611OpWave(DivInstrument* ins, int op, int disp);
   unsigned char noteInputMode;
   bool notifyWaveChange, notifySampleChange;
   bool recalcTimestamps;
@@ -1893,6 +1904,13 @@ class FurnaceGUI {
   // load() the options have been picked, so it doesn't bounce the file back.
   String pendingMIDIPath;
   bool displayMIDIImport, midiImportPending;
+  // an .nsf is held here while the track picker is up (like the MIDI one)
+  String pendingNSFPath;
+  bool displayNSFImport, nsfImportPending;
+  DivNSFInfo nsfInfo;
+  std::vector<bool> nsfTrackSel;
+  // off: picking a track replaces the previous pick (one track per import)
+  bool nsfMultiTrack;
 
   ImGuiWindowFlags globalWinFlags;
 
@@ -3270,6 +3288,7 @@ class FurnaceGUI {
   void insEditPV1000(DivInstrument* ins);
   void insEditBR811(DivInstrument* ins);
   void insEditBR1611(DivInstrument* ins);
+  void insEditBR411(DivInstrument* ins);
   void insEditBR1611PCMEnv(DivInstrument* ins);
   void insEditK053260(DivInstrument* ins);
   void insEditYMF292(DivInstrument* ins);

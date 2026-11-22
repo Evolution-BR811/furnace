@@ -1,0 +1,1811 @@
+From a923c9619a5918659aa0b0ea931deda46a05205f Mon Sep 17 00:00:00 2001
+From: Evolution BR811 <344454957+Evolution-BR811@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 19:58:45 -0400
+Subject: [PATCH] Import SID files (C64 music)
+
+PSID and RSID tunes are run on a small C64 (6502, SID, CIA/raster
+interrupts, the KERNAL IRQ routines) and converted like NSF tracks:
+editable patterns on the C64 channels, with instruments for the voice
+settings (waveform, ADSR, ring/sync, filter routing) and macros for what
+changes during a note and while it fades out.
+
+- non-linear pitch and a tuning fitted to the player's frequency table,
+  so every frequency comes out exact
+- the filter and volume belong to the note that owns them (macros), and
+  go to the pattern in notes longer than a macro
+- the player's hard restart becomes Furnace's (envelope reset time and
+  values), with 1Axx for notes without it
+- a pulse width that runs freely across notes goes to the pattern
+  (3xxx, 22xx/23xx) when that saves many instruments
+- the track picker of the NSF import is used for SID subtunes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KMJUrc1fn7dir5w2PfSPK2
+---
+ src/engine/engine.h                  |    1 +
+ src/engine/fileOps/fileOpsCommon.cpp |    4 +
+ src/engine/fileOps/vgm.cpp           | 1333 +++++++++++++++++++++++++-
+ src/gui/gui.cpp                      |    6 +-
+ 4 files changed, 1308 insertions(+), 36 deletions(-)
+
+diff --git a/src/engine/engine.h b/src/engine/engine.h
+index aae5df1..0b6f6b2 100644
+--- a/src/engine/engine.h
++++ b/src/engine/engine.h
+@@ -1135,6 +1135,7 @@ class DivEngine {
+   bool loadMIDI(unsigned char* file, size_t len);
+   bool loadVGM(unsigned char* file, size_t len);
+   bool loadNSF(unsigned char* file, size_t len);
++  bool loadSID(unsigned char* file, size_t len);
+ 
+   /**
+    * these functions load various instrument formats.
+diff --git a/src/engine/fileOps/fileOpsCommon.cpp b/src/engine/fileOps/fileOpsCommon.cpp
+index 098ba96..79aa0a6 100644
+--- a/src/engine/fileOps/fileOpsCommon.cpp
++++ b/src/engine/fileOps/fileOpsCommon.cpp
+@@ -55,6 +55,10 @@ bool DivEngine::load(unsigned char* f, size_t slen, const char* nameHint) {
+   if (memcmp(f,"NESM\x1a",5)==0 || memcmp(f,"NSFE",4)==0) {
+     return loadNSF(f,slen);
+   }
++  // SID: C64 music, played and converted the same way
++  if (memcmp(f,"PSID",4)==0 || memcmp(f,"RSID",4)==0) {
++    return loadSID(f,slen);
++  }
+ 
+   // step 1: try loading as a zlib-compressed file
+   logD("trying zlib...");
+diff --git a/src/engine/fileOps/vgm.cpp b/src/engine/fileOps/vgm.cpp
+index c9cf1d3..9bfd957 100644
+--- a/src/engine/fileOps/vgm.cpp
++++ b/src/engine/fileOps/vgm.cpp
+@@ -97,6 +97,8 @@ struct VGMChanTick {
+   // an index into the converter's table of FM sounds
+   int fm=-1;
+   int block=0; // and the block the driver wrote
++  // SID only: control register (without the gate), attack/decay, sustain/release
++  int sidCtrl=0, sidAD=0, sidSR=0;
+ };
+ 
+ struct VGMDPCMTrigger {
+@@ -639,6 +641,11 @@ struct VGMNESLog {
+   bool opllVRC7=false;
+   bool opllDrums=false; // rhythm mode is used at some point
+   double opllClock=3579545.0;
++  // SID (C64): events with reg 0x400+register
++  bool hasSID=false;
++  bool sid8580=false;
++  bool sidDigi=false; // samples through the volume register (left out)
++  double sidClock=985248.0;
+ };
+ 
+ // the macros of one note (an instrument candidate)
+@@ -692,6 +699,12 @@ struct VGMNESContext {
+   int gridMode=0;
+   // notes that had to use the closest instrument (instrument limit)
+   int mergedNotes=0;
++  // the song's tuning was already picked (SID)
++  bool tuningSet=false;
++  // SID hard restart: -1 not decided, 0 none, else ticks<<17|test<<16|AD<<8|SR
++  int sidHR=-1;
++  // SID pulse width in the pattern where it runs free (0: never)
++  int sidFreePW=1;
+ };
+ 
+ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong* sub, std::vector<String>& warns, String& err);
+@@ -699,9 +712,10 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+ // converts on a scratch copy of the song with both row grids, and returns the
+ // one to use: notes on even rows (1) if that needs no more instruments and
+ // approximates no more notes than the usual grid (0)
+-static int vgmPickGrid(const VGMNESLog& log, const VGMNESContext& ctx, const DivSong& ds) {
++static int vgmPickGrid(const VGMNESLog& log, const VGMNESContext& ctx, const DivSong& ds, bool pw=false) {
+   int score[2]={-1,-1};
+   int ins[2]={0,0};
++  int merged[2]={0,0};
+   for (int m=0; m<2; m++) {
+     DivSong t=ds;
+     // deep copies, so instruments shared with earlier tracks can be reused
+@@ -715,12 +729,17 @@ static int vgmPickGrid(const VGMNESLog& log, const VGMNESContext& ctx, const Div
+     t.subsong.push_back(sub);
+     VGMNESLog l=log;
+     VGMNESContext c=ctx;
+-    c.gridMode=m;
++    if (pw) {
++      c.sidFreePW=m;
++    } else {
++      c.gridMode=m;
++    }
+     c.mergedNotes=0;
+     std::vector<String> w;
+     String e;
+     if (vgmConvertNES(l,c,t,sub,w,e)) {
+       ins[m]=(int)(t.ins.size()-insBefore);
++      merged[m]=c.mergedNotes;
+       score[m]=c.mergedNotes*1000+ins[m];
+     }
+     for (DivInstrument* i: t.ins) delete i;
+@@ -730,6 +749,16 @@ static int vgmPickGrid(const VGMNESLog& log, const VGMNESContext& ctx, const Div
+       delete i;
+     }
+   }
++  if (pw) {
++    // the pulse width in the pattern is not always exact (a sweep that
++    // pauses now and then): only when the instruments don't fit otherwise,
++    // or it saves a lot of them
++    if (score[1]>=0 && score[0]>=0 && ((merged[0]>0 && score[1]<score[0]) || ins[1]*10<=ins[0]*6)) {
++      logI("SID import: pulse width in the pattern (%d instruments, %d otherwise)",ins[1],ins[0]);
++      return 1;
++    }
++    return 0;
++  }
+   if (score[1]>=0 && score[0]>=0 && score[1]<=score[0]) {
+     logI("VGM import: notes on even rows (%d instruments, %d with the usual rows)",ins[1],ins[0]);
+     return 1;
+@@ -857,7 +886,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     // (kick, snare, tom, top, hi-hat). patIdx maps them to the song's
+     // channels (FM 7-9 and the first three drums share theirs, like in
+     // Furnace's "OPLL with drums").
+-    const int NCH=26;
++    // 26-28: the three SID voices
++    const int NCH=29;
+     std::vector<VGMChanTick> chanTicks[NCH];
+     for (int c=0; c<NCH; c++) chanTicks[c].resize(numTicks);
+     std::vector<int> tonal;
+@@ -896,8 +926,14 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         numChans=base+11;
+       }
+     }
++    if (log.hasSID) {
++      for (int c=26; c<29; c++) {
++        patIdx[c]=numChans++;
++        tonal.push_back(c);
++      }
++    }
+     // song commands (speed, grooves, loop) go in the first channel
+-    const int cmdChan=log.hasNES?0:(log.has5B?5:(log.hasSN?8:12));
++    const int cmdChan=log.hasNES?0:(log.has5B?5:(log.hasSN?8:(log.hasOPLL?12:26)));
+     unsigned char ayRegs[16];
+     memset(ayRegs,0,16);
+     ayRegs[7]=0x3f;
+@@ -949,6 +985,11 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       opllRhythm.resize(numTicks,false);
+       opllCust.resize((size_t)numTicks*8,0);
+     }
++    // SID registers, and the global part (filter, volume) per tick
++    unsigned char sidRegs[32];
++    memset(sidRegs,0,32);
++    std::vector<unsigned char> sidGlobal;
++    if (log.hasSID) sidGlobal.resize((size_t)numTicks*4,0);
+     std::vector<VGMDPCMTrigger> triggers;
+     std::vector<VGMDPCMStop> stops;
+     VGMNESApu* apu=new VGMNESApu;
+@@ -966,8 +1007,17 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       bool snNoiseRestart=false;
+       bool opllKeyOn[14];
+       for (int i=0; i<14; i++) opllKeyOn[i]=false;
++      bool sidKeyOn[3]={false,false,false};
+       while (evPos<events.size() && events[evPos].time<=snap) {
+         VGMEvent& e=events[evPos++];
++        if (e.reg>=0x400) {
++          int a=e.reg&0x1f;
++          // the gate going from off to on starts a note (and starts the
++          // envelope over), even within one tick
++          if ((a==4 || a==11 || a==18) && (e.val&1) && !(sidRegs[a]&1)) sidKeyOn[a/7]=true;
++          sidRegs[a]=e.val;
++          continue;
++        }
+         if (e.reg>=0x300) {
+           int a=e.reg&0xff;
+           if (a>=64) continue;
+@@ -1125,9 +1175,96 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           chanTicks[5+i][k]=t;
+         }
+       }
++      if (log.hasSID) {
++        for (int i=0; i<3; i++) {
++          const unsigned char* r=&sidRegs[i*7];
++          VGMChanTick t;
++          t.aud=r[4]&1;
++          t.period=r[0]|(r[1]<<8);
++          t.vol=t.aud?15:0;
++          t.duty=r[2]|((r[3]&15)<<8);
++          t.restart=sidKeyOn[i];
++          t.sidCtrl=r[4]&0xfe;
++          t.sidAD=r[5];
++          t.sidSR=r[6];
++          chanTicks[26+i][k]=t;
++        }
++        memcpy(&sidGlobal[(size_t)k*4],&sidRegs[0x15],4);
++      }
+     }
+     delete apu;
+ 
++    // SID hard restart: many players turn the gate off and set the envelope
++    // to fixed values a tick or two before every note, so it starts clean.
++    // Furnace's C64 does the same by itself (envelope reset time and values):
++    // if most notes have it, those ticks are left to Furnace and don't go
++    // into the instruments
++    int hrN=0;
++    std::vector<char> sidHR[3];
++    if (log.hasSID) {
++      if (ctx.sidHR<0) {
++        std::map<int,int> cnt;
++        int eligible=0;
++        for (int v=0; v<3; v++) {
++          std::vector<VGMChanTick>& ct=chanTicks[26+v];
++          int lastOn=-1;
++          for (int b=1; b<numTicks; b++) {
++            if (!(ct[b].aud && (ct[b].restart || !ct[b-1].aud))) continue;
++            if (lastOn>=0 && b-lastOn>=5) {
++              eligible++;
++              for (int N=1; N<=3; N++) {
++                bool ok=true;
++                for (int t=b-N; t<b && ok; t++) {
++                  if (ct[t].aud || ct[t].sidAD!=ct[b-N].sidAD || ct[t].sidSR!=ct[b-N].sidSR) ok=false;
++                }
++                if (!ok) break;
++                const VGMChanTick& pt=ct[b-N-1];
++                if (pt.aud || pt.sidAD!=ct[b-N].sidAD || pt.sidSR!=ct[b-N].sidSR) {
++                  cnt[(N<<17)|((ct[b-N].sidCtrl&8)<<13)|(ct[b-N].sidAD<<8)|ct[b-N].sidSR]++;
++                  break;
++                }
++              }
++            }
++            lastOn=b;
++          }
++        }
++        int best=-1, bestCnt=0;
++        for (auto& i: cnt) {
++          if (i.second>bestCnt) {
++            bestCnt=i.second;
++            best=i.first;
++          }
++        }
++        ctx.sidHR=0;
++        if (best>=0 && eligible>=4 && bestCnt*2>=eligible) {
++          ctx.sidHR=best;
++          logI("SID import: hard restart %d ticks before the notes (AD %.2x SR %.2x%s) in %d of %d notes",best>>17,(best>>8)&0xff,best&0xff,(best&(1<<16))?", test bit":"",bestCnt,eligible);
++        }
++      }
++      if (ctx.sidHR>0) {
++        int hr=ctx.sidHR;
++        hrN=hr>>17;
++        ds.systemFlags[0].set("initResetTime",hrN);
++        ds.systemFlags[0].set("testAttack",(hr>>12)&15);
++        ds.systemFlags[0].set("testDecay",(hr>>8)&15);
++        ds.systemFlags[0].set("testSustain",(hr>>4)&15);
++        ds.systemFlags[0].set("testRelease",hr&15);
++        // the onsets that have it
++        for (int v=0; v<3; v++) {
++          std::vector<VGMChanTick>& ct=chanTicks[26+v];
++          sidHR[v].assign(numTicks,0);
++          for (int b=hrN+1; b<numTicks; b++) {
++            if (!(ct[b].aud && (ct[b].restart || !ct[b-1].aud))) continue;
++            bool ok=true;
++            for (int t=b-hrN; t<b && ok; t++) {
++              if (ct[t].aud || ct[t].sidAD!=((hr>>8)&0xff) || ct[t].sidSR!=(hr&0xff)) ok=false;
++            }
++            if (ok) sidHR[v][b]=1;
++          }
++        }
++      }
++    }
++
+     // --- step 4: PCM streams and lone $4011 writes ---
+     struct PCMStream {
+       int tick;
+@@ -1370,8 +1507,79 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         pitchOffsetOPLL[L]=(pick>=0)?pitchOffsetOPLL[pick]:0;
+       }
+     }
++    // and for the SID: a frequency register (16 bits, no blocks). the notes
++    // are found with the linear table; the song then uses Furnace's
++    // non-linear pitch, where the note's frequency plus the fine tune and
++    // pitch macro (in register units) reach any frequency exactly
++    std::vector<int> pitchOffsetSID;
++    DivPitchTable fwdSID, ptSIDn;
++    if (log.hasSID && !ctx.tuningSet) {
++      // the tuning of the player's frequency table (A-4 in Hz), so its notes
++      // land on Furnace's: the average distance of every played frequency
++      // to the closest semitone
++      double sx=0, sy=0;
++      int cnt=0;
++      for (int c=26; c<29; c++) {
++        for (int k=0; k<numTicks; k++) {
++          const VGMChanTick& t=chanTicks[c][k];
++          if (!t.aud || !t.restart || t.period<64) continue;
++          double hz=(double)t.period*log.sidClock/16777216.0;
++          double semi=12.0*std::log(hz/440.0)/std::log(2.0);
++          double frac=semi-floor(semi);
++          sx+=cos(frac*2.0*M_PI);
++          sy+=sin(frac*2.0*M_PI);
++          cnt++;
++        }
++      }
++      if (cnt>=8 && sx*sx+sy*sy>(double)cnt*(double)cnt*0.25) {
++        double off=atan2(sy,sx)/(2.0*M_PI);
++        double tun=440.0*pow(2.0,off/12.0);
++        tun=round(tun*100.0)/100.0;
++        if (fabs(tun-440.0)>=0.05) {
++          ds.tuning=tun;
++          logI("SID import: tuning A-4 = %.2f Hz",tun);
++        }
++      }
++      ctx.tuningSet=true;
++    }
++    if (log.hasSID) {
++      fwdSID.init(ds.tuning,log.sidClock,524288,0xffff,false,true);
++      ptSIDn.init(ds.tuning,log.sidClock,524288,0xffff,false,false);
++      const int span=1<<16;
++      pitchOffsetSID.assign(span,-1);
++      for (int off=0; off<180*128; off++) {
++        int f=fwdSID.get(off,0,0);
++        if (f<0) f=0;
++        if (f>65535) f=65535;
++        if (pitchOffsetSID[f]<0 || ((off&127)==0 && (pitchOffsetSID[f]&127)!=0)) pitchOffsetSID[f]=off;
++      }
++      std::vector<int> lo(span,-1), hi(span,-1);
++      int last=-1;
++      for (int L=0; L<span; L++) {
++        if (pitchOffsetSID[L]>=0) last=L;
++        lo[L]=last;
++      }
++      last=-1;
++      for (int L=span-1; L>=0; L--) {
++        if (pitchOffsetSID[L]>=0) last=L;
++        hi[L]=last;
++      }
++      for (int L=0; L<span; L++) {
++        if (pitchOffsetSID[L]>=0) continue;
++        int pick=-1;
++        if (lo[L]<0) {
++          pick=hi[L];
++        } else if (hi[L]<0) {
++          pick=lo[L];
++        } else {
++          pick=(L-lo[L]<=hi[L]-L)?lo[L]:hi[L];
++        }
++        pitchOffsetSID[L]=(pick>=0)?pitchOffsetSID[pick]:0;
++      }
++    }
+     // offset of a tick (noise: note number*128)
+     auto tickOffset=[&](int c, const VGMChanTick& t) -> int {
++      if (c>=26) return pitchOffsetSID[t.period&0xffff];
+       if (c>=12) {
+         if (curFixedBlock>0) return pitchOffsetBlock[curFixedBlock-1][(t.period>>(curFixedBlock-1))&511];
+         return pitchOffsetOPLL[t.period&0xffff];
+@@ -1389,6 +1597,12 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     };
+     // the period (or fnum<<block) Furnace writes for a pitch offset
+     auto periodAt=[&](int c, int off) -> int {
++      if (c>=26) {
++        int f=fwdSID.get(off,0,0);
++        if (f<0) f=0;
++        if (f>65535) f=65535;
++        return f;
++      }
+       if (c>=12) {
+         int f=fwdOPLL.get(off,0,0);
+         if (f<0) f=0;
+@@ -1436,16 +1650,23 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     // driver's own tuning is just an E5xx. only for songs with only the
+     // 2A03 (the pitch mode is one setting for the whole song); the pulses
+     // and the triangle use it, the noise keeps its notes.
+-    const bool canPeriod=log.hasNES && !log.has5B && !log.hasSN && !log.hasOPLL;
++    const bool sidOnly=log.hasSID && !log.hasNES && !log.has5B && !log.hasSN && !log.hasOPLL;
++    const bool canPeriod=(log.hasNES && !log.has5B && !log.hasSN && !log.hasOPLL && !log.hasSID) || sidOnly;
+     DivPitchTable ptPer;
+     if (canPeriod) ptPer.init(ds.tuning,log.clock,16,0x800,true,false);
+     bool curPeriod=false;
+     auto usesPer=[&](int c) -> bool {
+-      return curPeriod && c<3;
++      return curPeriod && (c<3 || c>=26);
+     };
+     // the period Furnace writes for note n with pitch r (r: 1/128 semitone,
+     // or periods in period mode)
+     auto periodOf=[&](int c, int n, int r) -> int {
++      if (usesPer(c) && c>=26) {
++        int f=ptSIDn.getBase(n)+r;
++        if (f<0) f=0;
++        if (f>65535) f=65535;
++        return f;
++      }
+       if (usesPer(c)) {
+         int p=ptPer.getBase(n)-r-1;
+         if (p<0) p=0;
+@@ -2136,6 +2357,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       // vibrato effect (04xy): (row, xy), -1 row: none
+       int vibRow, vibVal;
+       int obs; // ticks the note hears its instrument
++      int sidOnset=-1; // SID: the note's first tick
++      bool sidDutyCut=false; // SID: its pulse width didn't fit in the macro
+     };
+     std::vector<VGMMacroSet> sets;
+     std::map<String,int> setMap;
+@@ -2193,12 +2416,81 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     bool anyRepeat=false;
+     for (int c: tonal) if (onsetsRep[c]!=onsets[c]) anyRepeat=true;
+     int periodInexact=0;
++    // SID filter and volume: one set for the three voices. each tick they
++    // belong to a note: the latest one started on a voice that goes through
++    // the filter (or the latest one at all, if none does). that note's
++    // instrument gets the changes as macros.
++    std::vector<int> sidOwner;
++    int sidFirstOwner=-1;
++    // what Furnace starts with: cutoff 2047, no resonance, all filter modes
++    // (written with the first note), volume 15
++    static const int sidInit[4]={2047,0,7,15};
++    if (log.hasSID) {
++      sidOwner.assign(numTicks,-1);
++      std::vector<std::pair<int,int>> allOn;
++      for (int c=26; c<29; c++) for (int k: onsets[c]) allOn.push_back(std::make_pair(k,c));
++      std::sort(allOn.begin(),allOn.end());
++      // (the current note of each voice, and whether it went through the
++      // filter when it started)
++      int cur[3]={-1,-1,-1};
++      bool routed[3]={false,false,false};
++      size_t oi=0;
++      for (int k=0; k<numTicks; k++) {
++        while (oi<allOn.size() && allOn[oi].first==k) {
++          int v=allOn[oi].second-26;
++          cur[v]=k;
++          routed[v]=(sidGlobal[(size_t)k*4+2]>>v)&1;
++          oi++;
++        }
++        int best=-1, bestR=-1;
++        for (int v=0; v<3; v++) {
++          if (cur[v]<0) continue;
++          if (best<0 || cur[v]>=cur[best]) best=v;
++          if (routed[v] && (bestR<0 || cur[v]>=cur[bestR])) bestR=v;
++        }
++        if (bestR>=0) best=bestR;
++        sidOwner[k]=(best>=0)?(((26+best)<<24)|cur[best]):-1;
++      }
++      if (!allOn.empty()) sidFirstOwner=sidOwner[allOn[0].first];
++    }
++    // SID pulse width that runs on its own across the notes (a sweep the
++    // player never starts over): it goes to the pattern (3xxx, 22xx/23xx),
++    // not into the instruments, which would otherwise differ by where in the
++    // sweep each note starts
++    bool sidFreePW[3]={false,false,false};
++    if (log.hasSID) {
++      for (int v=0; v<3; v++) {
++        std::vector<VGMChanTick>& ct=chanTicks[26+v];
++        std::vector<int> d;
++        for (int k=1; k<numTicks; k++) if (ct[k].duty!=ct[k-1].duty) d.push_back(abs(ct[k].duty-ct[k-1].duty));
++        if (d.size()<16) continue;
++        std::sort(d.begin(),d.end());
++        int md=d[d.size()/2];
++        int cnt=0, smooth=0;
++        std::set<int> starts;
++        for (int b: onsets[26+v]) {
++          if (b<1) continue;
++          bool pulse=false;
++          for (int k=b; k<std::min(numTicks,b+3); k++) if (ct[k].sidCtrl&0x40) pulse=true;
++          if (!pulse) continue;
++          cnt++;
++          starts.insert(ct[b].duty);
++          if (abs(ct[b].duty-ct[b-1].duty)<=2*md+1) smooth++;
++        }
++        if (ctx.sidFreePW && cnt>=4 && smooth*10>=cnt*8 && starts.size()>=4) {
++          sidFreePW[v]=true;
++          logI("SID import: voice %d: free-running pulse width",v+1);
++        }
++      }
++    }
+     for (int pass=0; pass<8; pass++) {
+       const bool allowADSR=!(pass&1);
+       const bool useRep=(pass&2);
+       curPeriod=(pass&4);
+       if (useRep && !anyRepeat) continue;
+       if (curPeriod && !canPeriod) continue;
++      // (the SID always uses periods: its frequencies need it to come out exact)
++      if (sidOnly && !curPeriod) continue;
+       // (a later subsong follows the pitch mode of the first)
+       if (ctx.pitchMode>=0 && curPeriod!=(ctx.pitchMode==1)) continue;
+       periodInexact=0;
+@@ -2213,7 +2505,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         std::vector<int>& on=useRep?onsetsRep[c]:onsets[c];
+         const bool is5B=(c>=5 && c<8);
+         const bool isSN=(c>=8 && c<12);
+-        const bool isOPLL=(c>=12);
++        const bool isOPLL=(c>=12 && c<26);
++        const bool isSID=(c>=26);
+         size_t i=0;
+         while (i<on.size()) {
+           int a=on[i];
+@@ -2222,6 +2515,9 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           int s=next;
+           while (s>a && !ct[s-1].aud) s--;
+           if (s<=a) s=a+1;
++          // (SID: a gate off that is only the hard restart before the next
++          // note is not the end of this one: Furnace does it)
++          if (isSID && hrN>0 && next<numTicks && sidHR[c-26][next] && s>=next-hrN) s=next;
+           int rowA=rowOf(a+shift);
+           int delayA=(a+shift)-rowStart[rowA];
+           // how the note ends when it goes silent before the next one:
+@@ -2234,7 +2530,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           int adsrA=-1, adsrEnd=-1;
+           bool adsr=false;
+           // (not on FM: the end of an FM note is a key off, never a volume)
+-          if (c!=2 && !isOPLL) {
++          if (c!=2 && !isOPLL && !isSID) {
+             std::vector<int> rv;
+             for (int k=a; k<std::min(next,s+1); k++) rv.push_back(ct[k].vol);
+             adsr=vgmFindADSR(rv,adsrA,adsrEnd);
+@@ -2262,6 +2558,27 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+             }
+           }
+           int macroEnd=useOff?s:std::min(next,s+1);
++          // SID: after the release (gate off) the note fades out on its own
++          // and the player often keeps changing it (vibrato, pulse width):
++          // the macros go on until it has faded
++          int sidFadeEnd=next;
++          if (isSID) {
++            static const int relMs[16]={6,24,48,72,114,168,204,240,300,750,1500,2400,3000,9000,15000,24000};
++            if (s<next) {
++              int rel=ct[std::max(a,s-1)].sidSR&15;
++              sidFadeEnd=std::min(next,s+1+(int)ceil((double)relMs[rel]*sub->hz/1000.0));
++            }
++            // (pitch and pulse width go on during it; Furnace's hard restart
++            // only writes the envelope and the control register)
++            macroEnd=std::max(macroEnd,std::min(sidFadeEnd,a+255));
++            // the hard restart before the next note is Furnace's: the voice's
++            // other settings stop changing there
++            if (hrN>0 && next<numTicks && sidHR[c-26][next]) sidFadeEnd=std::max(a+1,std::min(sidFadeEnd,next-hrN));
++          }
++          // (ticks that count: heard, or fading out on the SID)
++          auto live=[&](int k) -> bool {
++            return ct[k].aud || (isSID && k<macroEnd);
++          };
+ 
+           // FM: if Furnace's own choice of block can't make one of the note's
+           // pitches, the instrument takes the driver's block (fixed block)
+@@ -2281,7 +2598,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           }
+           // base note: the most common note of the note
+           std::map<int,int> noteCount;
+-          for (int k=a; k<macroEnd; k++) if (ct[k].aud) noteCount[tickNote(c,ct[k])]++;
++          for (int k=a; k<macroEnd; k++) if (live(k)) noteCount[tickNote(c,ct[k])]++;
+           int base=tickNote(c,ct[a]);
+           int bestCnt=-1;
+           for (auto& nc: noteCount) {
+@@ -2305,11 +2622,11 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           std::vector<int> arpAdd(macroEnd-a,0);
+           std::vector<std::pair<int,int>> arpFx;
+           std::vector<std::array<int,4>> legato;
+-          if (c!=3 && c!=11 && c<21 && c!=4) {
++          if (c!=3 && c!=11 && (c<21 || c>=26) && c!=4) {
+             std::vector<int> offs(macroEnd-a), ns(macroEnd-a);
+             int lo=tickOffset(c,ct[a]);
+             for (int k=a; k<macroEnd; k++) {
+-              if (ct[k].aud) lo=tickOffset(c,ct[k]);
++              if (live(k)) lo=tickOffset(c,ct[k]);
+               offs[k-a]=lo;
+               ns[k-a]=(lo+64)>>7;
+             }
+@@ -2490,9 +2807,10 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           int envPeriod=-1;
+           for (int k=a; k<macroEnd; k++) {
+             const VGMChanTick& t=ct[k];
+-            int off=t.aud?tickOffset(c,t):lastOff;
+-            int per=t.aud?t.period:lastPer;
+-            int duty=t.aud?t.duty:lastDuty;
++            const bool tl=live(k);
++            int off=tl?tickOffset(c,t):lastOff;
++            int per=tl?t.period:lastPer;
++            int duty=tl?t.duty:lastDuty;
+             lastOff=off;
+             lastPer=per;
+             lastDuty=duty;
+@@ -2500,7 +2818,10 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+             vVol.push_back(t.vol);
+             vDuty.push_back(duty);
+             vArp.push_back(n-segBase[k-a]-arpAdd[k-a]);
+-            if (usesPer(c)) {
++            if (usesPer(c) && isSID) {
++              // SID: the frequency minus the note's own frequency
++              vPitch.push_back(per-ptSIDn.getBase(std::max(0,std::min(179,n))));
++            } else if (usesPer(c)) {
+               // (a period at the limit of the register is reached by any pitch
+               // past it: take the one closest to none)
+               int bse=ptPer.getBase(std::max(0,std::min(179,n)));
+@@ -2567,6 +2888,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+                   f0=f.first;
+                 }
+               }
++              // (SID: E5xx reaches 127 register units; the rest stays in the macro)
++              if (isSID) f0=std::max(-127,std::min(127,f0));
+               for (size_t k=0; k<vPitch.size(); k++) if (segIdx[k]==sg) vPitch[k]-=f0;
+               if (sg==0) {
+                 fine=f0;
+@@ -2580,9 +2903,9 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           // a pitch offset that writes the same period as none at all is no
+           // pitch offset: the period register can't tell them apart, so the
+           // instrument doesn't need it (each note would get its own otherwise)
+-          if (c!=3 && c!=11 && c!=4 && c<21) {
++          if (c!=3 && c!=11 && c!=4 && (c<21 || c>=26)) {
+             for (size_t j=0; j<vPitch.size(); j++) {
+-              if (vPitch[j]==0 || !ct[a+j].aud) continue;
++              if (vPitch[j]==0 || !live(a+j)) continue;
+               int n=vArp[j]+segBase[j]+arpAdd[j];
+               int f=(segIdx[j]==0)?fine:legato[segIdx[j]-1][3];
+               if (periodOf(c,n,f)==ct[a+j].period) vPitch[j]=0;
+@@ -2590,9 +2913,9 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           }
+           // period mode: every tick must come out exactly (very low notes or
+           // big fine tunes may not fit; the song then stays linear)
+-          if (curPeriod && c<3) {
++          if (curPeriod && (c<3 || c>=26)) {
+             for (size_t j=0; j<vPitch.size(); j++) {
+-              if (!ct[a+j].aud) continue;
++              if (!live(a+j)) continue;
+               int n=vArp[j]+segBase[j]+arpAdd[j];
+               int f=(segIdx[j]==0)?fine:legato[segIdx[j]-1][3];
+               bool bad=(n<0 || n>179 || f<-127 || f>127 || periodOf(c,n,f+vPitch[j])!=ct[a+j].period);
+@@ -2607,7 +2930,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           // speed and depth, from the note's start or from a row start
+           int vibRow=-1, vibVal=0;
+           // (also on top of a chord arpeggio, 00xy + 04xy)
+-          if (c!=3 && c!=11 && c!=4 && c<21 && legato.empty() && vgmAllZero(vArp) && !vgmAllZero(vPitch) && macroEnd-a>=4) {
++          if (c!=3 && c!=11 && c!=4 && c<21 && !isSID && legato.empty() && vgmAllZero(vArp) && !vgmAllZero(vPitch) && macroEnd-a>=4) {
+             static short vibT[64];
+             static bool vibInit=false;
+             if (!vibInit) {
+@@ -2663,7 +2986,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           // what this note plays, tick by tick (to compare with instruments)
+           std::vector<int> rawV[6]={vVol,vDuty,vArp,vPitch,vNoise,vEnv};
+           VGMMacroSet ms;
+-          ms.type=isOPLL?((c>=21)?8:7):(isSN?((c==11)?6:5):(is5B?4:((c<2)?0:c)));
++          ms.type=isSID?9:(isOPLL?((c>=21)?8:7):(isSN?((c==11)?6:5):(is5B?4:((c<2)?0:c))));
+           ms.fm=isOPLL?ct[a].fm:-1;
+           if (curFixedBlock>0) ms.fmKey=fmt::sprintf("B%d;",curFixedBlock);
+           if (isOPLL && c<21) {
+@@ -2696,6 +3019,97 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+               }
+             }
+           }
++          if (isSID && sidFreePW[c-26]) {
++            vDuty.assign(vDuty.size(),0);
++            ms.fmKey+="P;";
++          }
++          if (isSID) {
++            // the voice's own settings: what they are when the note starts
++            // (the instrument's), and changes after that (macros), also
++            // while the note fades out after its release
++            const int sv=c-26;
++            auto fieldOf=[&](int f, int k) -> int {
++              const VGMChanTick& t=ct[k];
++              switch (f) {
++                case 0: return t.sidCtrl>>4;
++                case 1: return (t.sidCtrl&0x0e)|1;
++                case 2: return t.sidAD>>4;
++                case 3: return t.sidAD&15;
++                case 4: return t.sidSR>>4;
++                case 5: return t.sidSR&15;
++                case 6: return (sidGlobal[(size_t)k*4+2]>>sv)&1;
++              }
++              return 0;
++            };
++            int lenV=std::min(sidFadeEnd-a,255);
++            if (lenV<1) lenV=1;
++            int base[7];
++            for (int f=0; f<7; f++) base[f]=fieldOf(f,a);
++            ms.fmKey+=fmt::sprintf("S%d,%d,%d,%d,%d,%d,%d;",base[0],base[1],base[2],base[3],base[4],base[5],base[6]);
++            for (int f=0; f<7; f++) {
++              std::vector<int> seq;
++              bool changes=false;
++              for (int k=a; k<a+lenV; k++) {
++                int v=fieldOf(f,k);
++                if (v!=base[f]) changes=true;
++                seq.push_back(v);
++              }
++              // Furnace starts with the test bit off and, with a sustain of
++              // 15, a decay of 0: those take a macro to come out right
++              bool need=changes;
++              if (f==1 && (base[1]&8)) need=true;
++              if (f==3 && base[4]==15 && base[3]!=0) need=true;
++              if (!need) continue;
++              int lp=vgmCompress(seq);
++              ms.fmMac.push_back(std::make_pair(f,seq));
++              ms.fmMacLoop.push_back(lp);
++              ms.fmKey+=fmt::sprintf("f%d:%sL%d;",f,vgmMacroKey(seq),lp);
++            }
++            // the filter and the volume are shared by the voices: their changes
++            // belong to the note that owns them (see sidOwner)
++            int ownEnd=a;
++            while (ownEnd<std::min(next,a+255) && sidOwner[ownEnd]==((c<<24)|a)) ownEnd++;
++            if (ownEnd>a) {
++              for (int f=10; f<14; f++) {
++                std::vector<int> seq;
++                bool changes=false;
++                for (int k=a; k<ownEnd; k++) {
++                  const unsigned char* g=&sidGlobal[(size_t)k*4];
++                  int v=0;
++                  switch (f) {
++                    case 10: v=(g[0]&7)|(g[1]<<3); break;
++                    case 11: v=g[2]>>4; break;
++                    case 12: v=g[3]>>4; break;
++                    case 13: v=g[3]&15; break;
++                  }
++                  if (!seq.empty() && v!=seq[0]) changes=true;
++                  seq.push_back(v);
++                }
++                if (f==13 && log.sidDigi) continue;
++                // (or if it is not what it was before the note: a player that
++                // sets it as the note starts. before the first note it is
++                // what Furnace starts with)
++                int before=sidInit[f-10];
++                if (a>0 && sidFirstOwner!=((c<<24)|a)) {
++                  const unsigned char* g=&sidGlobal[(size_t)(a-1)*4];
++                  switch (f) {
++                    case 10: before=(g[0]&7)|(g[1]<<3); break;
++                    case 11: before=g[2]>>4; break;
++                    case 12: before=g[3]>>4; break;
++                    case 13: before=g[3]&15; break;
++                  }
++                }
++                if (!changes && seq[0]==before) continue;
++                // (no loop: the macro must stop writing once the note no
++                // longer owns these, so it only holds its last value)
++                vgmTrim(seq);
++                int lp=-1;
++                ms.fmMac.push_back(std::make_pair(f,seq));
++                ms.fmMacLoop.push_back(lp);
++                ms.fmKey+=fmt::sprintf("f%d:%sL%d;",f,vgmMacroKey(seq),lp);
++              }
++            }
++          }
+           int relTick=-1;
+           if (adsr && adsrEnd<(int)vVol.size()) {
+             // attack | sustain sustain / fall: the loop (on the sustain) comes
+@@ -2738,6 +3152,17 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           ms.loop[5]=-1;
+           // a macro holds at most 255 ticks: if something still changes after
+           // that, split the note at a row start and go on from there.
++          // (not on the SID, where a new note would start the envelope over:
++          // what doesn't fit is cut)
++          bool dutyCut=false;
++          if (isSID) {
++            if (vDuty.size()>255 && ms.loop[1]<0) dutyCut=true;
++            std::vector<int>* vv[4]={&vVol,&vDuty,&vArp,&vPitch};
++            for (int m=0; m<4; m++) {
++              if (vv[m]->size()>255) vv[m]->resize(255);
++              if (ms.loop[m]>=(int)vv[m]->size()) ms.loop[m]=-1;
++            }
++          }
+           if (vVol.size()>255 || vDuty.size()>255 || vArp.size()>255 || vPitch.size()>255 || vNoise.size()>255 || vEnv.size()>255) {
+             int limit=a+255;
+             int splitRow=rowOf(limit+shift);
+@@ -2748,13 +3173,18 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           }
+           // (the OPLL drums always get one: Furnace doesn't set a drum's
+           // volume again on a new note, only when its volume macro runs)
+-          bool volMacro=(vVol.size()>1) || adsr || (c>=21);
++          bool volMacro=((vVol.size()>1) || adsr || (c>=21)) && !isSID;
+           int noteVol=volMacro?15:vVol[0];
+           if (c==2 && !volMacro) noteVol=15;
+           ms.has[0]=volMacro;
+           // the triangle, the SN squares and FM have no duty/mode macro
+           // (FM: the patch number, the wave macro if it changes)
+           ms.has[1]=(c!=2 && !(isSN && c!=11) && !(isOPLL && c>=21));
++          // (SID: no volume of its own, the pulse width is the duty macro)
++          if (isSID) {
++            noteVol=15;
++            ms.has[1]=true;
++          }
+           ms.has[2]=!vgmAllZero(vArp);
+           ms.has[3]=!vgmAllZero(vPitch);
+           ms.has[4]=!vNoise.empty();
+@@ -2778,6 +3208,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           // how long this note hears its instrument: until the note off, or
+           // until the next note (a held value counts too)
+           int obs=std::min(512,(useOff?s:next)-a);
++          // (the SID goes on sounding while it fades out)
++          if (isSID) obs=std::min(512,std::max(obs,macroEnd-a));
+           // what instrument x plays for macro m over n ticks (released at relT),
+           // with an absent macro playing 0, or the volume column for the volume
+           auto simOut=[&](const VGMMacroSet& x, int m, int relT, int n, int colVol, std::vector<int>& out) {
+@@ -2960,6 +3392,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           nr.cutTicks=s-a;
+           nr.relTick=relTick;
+           nr.obs=obs;
++          nr.sidOnset=isSID?a:-1;
++          nr.sidDutyCut=isSID && dutyCut;
+           nr.set=setIndex;
+           nr.envPeriod=usesEnv?envPeriod:-1;
+           nr.legato=legato;
+@@ -3323,9 +3757,69 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       }
+       created[nr.set]=true;
+       DivInstrument* ins=new DivInstrument;
+-      ins->type=(ms.type==4)?DIV_INS_AY:((ms.type>=7)?DIV_INS_OPLL:((ms.type>=5)?DIV_INS_STD:DIV_INS_NES));
++      ins->type=(ms.type==9)?DIV_INS_C64:((ms.type==4)?DIV_INS_AY:((ms.type>=7)?DIV_INS_OPLL:((ms.type>=5)?DIV_INS_STD:DIV_INS_NES)));
+       String name;
+-      if (ms.type>=7) {
++      if (ms.type==9) {
++        // the voice's settings at the start of the note (S<wave>,<bits>,
++        // <attack>,<decay>,<sustain>,<release>,<filter>;)
++        int b[7]={0,1,0,0,0,0,0};
++        size_t sp=ms.fmKey.find('S');
++        if (sp!=String::npos) sscanf(ms.fmKey.c_str()+sp+1,"%d,%d,%d,%d,%d,%d,%d",&b[0],&b[1],&b[2],&b[3],&b[4],&b[5],&b[6]);
++        DivInstrumentC64& c64=ins->c64;
++        c64.triOn=b[0]&1;
++        c64.sawOn=b[0]&2;
++        c64.pulseOn=b[0]&4;
++        c64.noiseOn=b[0]&8;
++        c64.oscSync=b[1]&2;
++        c64.ringMod=b[1]&4;
++        c64.a=b[2];
++        c64.d=b[3];
++        c64.s=b[4];
++        c64.r=b[5];
++        c64.toFilter=b[6];
++        c64.initFilter=false;
++        c64.dutyIsAbs=true;
++        c64.filterIsAbs=true;
++        c64.resetDuty=true;
++        // (a free-running pulse width is left alone by the notes)
++        bool freePW=(ms.fmKey.find("P;")!=String::npos);
++        if (freePW) c64.resetDuty=false;
++        // (Furnace's hard restart: with the test bit only if the player's has it)
++        c64.noTest=!(ctx.sidHR>0 && (ctx.sidHR&(1<<16)));
++        c64.duty=ms.v[1].empty()?2048:ms.v[1][0];
++        static const char* waveNames[16]={
++          "Silent","Triangle","Saw","Tri+Saw","Pulse","Tri+Pulse","Saw+Pulse","Tri+Saw+Pulse",
++          "Noise","Noise+Tri","Noise+Saw","Noise+Tri+Saw","Noise+Pulse","Noise+Tri+Pulse","Noise+Saw+Pulse","Noise+all"
++        };
++        name=waveNames[b[0]&15];
++        if (c64.ringMod) name+=" ring";
++        if (c64.oscSync) name+=" sync";
++        if (c64.toFilter) name+=" filter";
++        bool anyFilterMac=false;
++        for (size_t fi=0; fi<ms.fmMac.size(); fi++) {
++          int f=ms.fmMac[fi].first;
++          DivInstrumentMacro* mac=NULL;
++          switch (f) {
++            case 0: mac=&ins->std.waveMacro; break;
++            case 1: mac=&ins->std.ex4Macro; break;
++            case 2: mac=&ins->std.ex5Macro; break;
++            case 3: mac=&ins->std.ex6Macro; break;
++            case 4: mac=&ins->std.ex7Macro; break;
++            case 5: mac=&ins->std.ex8Macro; break;
++            case 6: mac=&ins->std.ex3Macro; break;
++            case 10: mac=&ins->std.algMacro; anyFilterMac=true; break;
++            case 11: mac=&ins->std.ex2Macro; anyFilterMac=true; break;
++            case 12: mac=&ins->std.ex1Macro; anyFilterMac=true; break;
++            case 13: mac=&ins->std.volMacro; break;
++          }
++          if (mac==NULL) continue;
++          const std::vector<int>& v=ms.fmMac[fi].second;
++          mac->len=v.size();
++          for (size_t k=0; k<v.size(); k++) mac->val[k]=v[k];
++          if (ms.fmMacLoop[fi]>=0) mac->loop=ms.fmMacLoop[fi];
++        }
++        if (anyFilterMac) name+=" sweep";
++      } else if (ms.type>=7) {
+         const VGMFMSound& fs=fmSounds[ms.fm];
+         static const char* opllNames[16]={
+           "FM custom","Violin","Guitar","Piano","Flute","Clarinet","Oboe","Trumpet",
+@@ -3437,13 +3931,16 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         (ms.type==4 || ms.type==7)?&ins->std.waveMacro:&ins->std.dutyMacro,
+         &ins->std.arpMacro,
+         &ins->std.pitchMacro,
+-        (ms.type>=5)?&ins->std.panLMacro:&ins->std.dutyMacro,
+-        (ms.type>=7)?&ins->std.phaseResetMacro:&ins->std.ex2Macro
++        (ms.type>=5 && ms.type<9)?&ins->std.panLMacro:&ins->std.dutyMacro,
++        (ms.type>=7 && ms.type<9)?&ins->std.phaseResetMacro:&ins->std.ex2Macro
+       };
+       for (int m=0; m<6; m++) {
+         if (!ms.has[m]) continue;
+         // FM: a patch that never changes is the instrument's own patch
+         if (m==1 && ms.type==7 && ms.v[1].size()<=1) continue;
++        // SID: a pulse width that never changes is the instrument's own
++        if (m==1 && ms.type==9 && (ms.v[1].size()<=1 || ms.fmKey.find("P;")!=String::npos)) continue;
++        if (ms.type==9 && (m==0 || m>=4)) continue;
+         DivInstrumentMacro* mac=macros[m];
+         if (ms.loop[m]>=0) mac->loop=ms.loop[m];
+         if (ms.rel[m]>=0) {
+@@ -3487,7 +3984,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         cell[DIV_PAT_NOTE]=nr.base;
+         cell[DIV_PAT_INS]=ms.ins;
+         const int pc=patIdx[c];
+-        if (noteVol!=colVol[pc]) {
++        // (the SID's volume column is the volume of the whole chip: never)
++        if (noteVol!=colVol[pc] && c<26) {
+           cell[DIV_PAT_VOL]=noteVol;
+           colVol[pc]=noteVol;
+           noteW(0,pc,nr.rowA,noteVol);
+@@ -3644,7 +4142,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       static const char* chanName[NCH]={
+         "P1","P2","TRI","NOI","DMC","5B-A","5B-B","5B-C","SQ1","SQ2","SQ3","NOI",
+         "FM1","FM2","FM3","FM4","FM5","FM6","FM7","FM8","FM9",
+-        "BD","SD","TOM","TOP","HH"
++        "BD","SD","TOM","TOP","HH",
++        "SID1","SID2","SID3"
+       };
+       std::map<int,String> pcName;
+       for (int c=0; c<NCH; c++) {
+@@ -3711,6 +4210,160 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       }
+     }
+ 
++    // SID filter and volume during a note longer than a macro (255 ticks):
++    // from there on the changes go to the pattern, on the row they land on
++    // (4xxx cutoff, 13xx resonance, 14xx mode, volume column)
++    if (log.hasSID) {
++      auto gField=[&](int k, int f) -> int {
++        const unsigned char* g=&sidGlobal[(size_t)k*4];
++        switch (f) {
++          case 0: return (g[0]&7)|(g[1]<<3);
++          case 1: return g[2]>>4;
++          case 2: return g[3]>>4;
++          case 3: return g[3]&15;
++        }
++        return 0;
++      };
++      int known[4]={-1,-1,-1,-1};
++      int lastVolCol[3]={15,15,15};
++      int tailFx=0;
++      for (int r=0; r<numRows; r++) {
++        int k0=rowStart[r]-shift;
++        int k1=(r+1<numRows)?(rowStart[r+1]-shift):numTicks;
++        if (k0<0 || k0>=numTicks) continue;
++        for (int k=k0; k<k1 && k<numTicks; k++) {
++          int id=sidOwner[k];
++          if (id<0) continue;
++          int oc=id>>24, oa=id&0xffffff;
++          if (k-oa<255) {
++            for (int f=0; f<4; f++) known[f]=gField(k,f);
++            continue;
++          }
++          // (only at the row's start)
++          if (k!=k0) continue;
++          for (int f=0; f<4; f++) {
++            int v=gField(k,f);
++            if (v==known[f] || known[f]<0) continue;
++            if (f==3 && log.sidDigi) continue;
++            short* cell=cellAt(oc,r);
++            switch (f) {
++              case 0: vgmPutFx(cell,0x40|(v>>8),v&0xff,maxFxCol[oc]); break;
++              case 1: vgmPutFx(cell,0x13,v,maxFxCol[oc]); break;
++              case 2: vgmPutFx(cell,0x14,v&7,maxFxCol[oc]); break;
++              case 3: {
++                // (Furnace ignores a volume column equal to the channel's
++                // last one, even if a macro changed the volume since: use a
++                // channel where it is new; the volume is the chip's anyway)
++                int vc=oc;
++                for (int t=0; t<3 && lastVolCol[vc-26]==v; t++) vc=26+((vc-26+1)%3);
++                cellAt(vc,r)[DIV_PAT_VOL]=v;
++                lastVolCol[vc-26]=v;
++                break;
++              }
++            }
++            known[f]=v;
++            tailFx++;
++          }
++        }
++      }
++      if (tailFx>0) logI("SID import: %d filter/volume changes in long notes went to the pattern",tailFx);
++      // pulse width of notes longer than their macro: 3xxx on the rows after
++      {
++        int tails=0;
++        for (VGMNoteRec& nr: recs) {
++          if (nr.c<26 || !nr.sidDutyCut || nr.sidOnset<0) continue;
++          int c=nr.c;
++          std::vector<VGMChanTick>& ct=chanTicks[c];
++          std::vector<int>& on=onsets[c];
++          auto it=std::upper_bound(on.begin(),on.end(),nr.sidOnset);
++          int nextOn=(it!=on.end())?*it:numTicks;
++          int from=nr.sidOnset+255;
++          if (from>=nextOn) continue;
++          int known=ct[from-1].duty;
++          for (int r=rowOf(from+shift); r<numRows; r++) {
++            int k0=rowStart[r]-shift;
++            if (k0>=nextOn || k0>=numTicks) break;
++            if (k0<from) continue;
++            if (ct[k0].duty==known) continue;
++            known=ct[k0].duty;
++            vgmPutFx(cellAt(c,r),0x30|(known>>8),known&0xff,maxFxCol[c]);
++            tails++;
++          }
++        }
++        if (tails>0) logI("SID import: %d pulse width changes in long notes went to the pattern",tails);
++      }
++      // free-running pulse width: Furnace's goes down by the slide (22xx +,
++      // 23xx -) every tick; at each row start the slide that the row needs,
++      // and 3xxx where the value is off
++      for (int v=0; v<3; v++) {
++        if (!sidFreePW[v]) continue;
++        std::vector<VGMChanTick>& ct=chanTicks[26+v];
++        int P=-1, S=0;
++        int fx=0;
++        for (int r=0; r<numRows; r++) {
++          int k0=rowStart[r]-shift;
++          int k1=(r+1<numRows)?(rowStart[r+1]-shift):numTicks;
++          if (k0<0 || k0>=numTicks) continue;
++          if (k1>numTicks) k1=numTicks;
++          // the most common step in this row
++          std::map<int,int> dc;
++          for (int k=k0+1; k<k1; k++) dc[ct[k].duty-ct[k-1].duty]++;
++          int step=0, bc=0;
++          for (auto& i: dc) {
++            if (i.second>bc || (i.second==bc && i.first==-S)) {
++              bc=i.second;
++              step=i.first;
++            }
++          }
++          if (k1-k0<2) step=-S;
++          int Snew=-step;
++          if (Snew>255) Snew=255;
++          if (Snew<-255) Snew=-255;
++          short* cell=cellAt(26+v,r);
++          if (Snew!=S) {
++            if (Snew>=0) {
++              vgmPutFx(cell,0x22,Snew,maxFxCol[26+v]);
++            } else {
++              vgmPutFx(cell,0x23,-Snew,maxFxCol[26+v]);
++            }
++            S=Snew;
++            fx++;
++          }
++          int pred=(P<0)?-1:std::max(0,std::min(4095,P-S));
++          if (pred!=ct[k0].duty) {
++            int X=std::max(0,std::min(4095,ct[k0].duty+S));
++            vgmPutFx(cell,0x30|(X>>8),X&0xff,maxFxCol[26+v]);
++            fx++;
++            P=std::max(0,std::min(4095,X-S));
++          } else {
++            P=pred;
++          }
++          for (int k=k0+1; k<k1; k++) P=std::max(0,std::min(4095,P-S));
++        }
++        logI("SID import: voice %d: %d pulse width effects",v+1,fx);
++      }
++      // notes without the hard restart: 1A01 turns Furnace's off for them,
++      // 1A00 back on (where the reset would happen)
++      if (hrN>0) {
++        int masks=0;
++        for (int v=0; v<3; v++) {
++          bool mask=false;
++          std::vector<int>& on=onsets[26+v];
++          for (size_t i=1; i<on.size(); i++) {
++            int b=on[i];
++            bool want=!sidHR[v][b];
++            if (want==mask) continue;
++            int r=rowOf(std::max(0,b-hrN)+shift);
++            if (r>=numRows) break;
++            vgmPutFx(cellAt(26+v,r),0x1a,want?1:0,maxFxCol[26+v]);
++            mask=want;
++            masks++;
++          }
++        }
++        if (masks>0) logI("SID import: %d hard restart switches",masks);
++      }
++    }
++
+     // --- step 12: loop or end ---
+     {
+       int lastRow=numRows-1;
+@@ -4308,6 +4961,160 @@ struct NSFMachine {
+   unsigned char latch5B=0;
+   int expWrites=0;
+   std::vector<std::pair<int,int>> frameWrites; // writes of the current frame
++  // where a call returns to (an address the program never runs)
++  unsigned short retAddr=0x3ff0;
++
++  // C64 mode (SID files): 64 KB of RAM, the I/O area and a few KERNAL
++  // routines, enough for music players
++  bool c64=false;
++  unsigned char* mem=NULL;
++  unsigned char kernal[0x2000]; // $E000-$FFFF when the KERNAL is banked in
++  unsigned char sidRegs[32];
++  unsigned char vicIrqMask=0;
++  unsigned short ciaLatch=0x4025;
++  bool ciaLatchSet=false;
++  unsigned char ciaMask=0x01; // CIA 1 interrupts enabled (timer A)
++  unsigned int lfsr=0x7ffff8;
++  int linesPerFrame=312;
++  int volWrites=0; // writes to $D418 in this frame (many: a digi)
++  bool pageDirty[256];
++
++  bool c64IO() {
++    return (mem[1]&3)!=0 && (mem[1]&4);
++  }
++  bool c64Kernal() {
++    return (mem[1]&2);
++  }
++  int rasterLine() {
++    return (int)((cycles/63)%linesPerFrame);
++  }
++
++  unsigned char c64Read(unsigned short a) {
++    if (a>=0xd000 && a<0xe000 && c64IO()) {
++      if (a>=0xd400 && a<0xd800) {
++        int r=a&0x1f;
++        // oscillator 3 output: players use it as a random number
++        if (r==0x1b) {
++          lfsr=((lfsr<<1)|(((lfsr>>22)^(lfsr>>17))&1))&0x7fffff;
++          return (unsigned char)(lfsr>>15);
++        }
++        return 0;
++      }
++      if (a>=0xd000 && a<0xd400) {
++        int r=a&0x3f;
++        if (r==0x12) return (unsigned char)rasterLine();
++        if (r==0x11) return (unsigned char)(0x1b|((rasterLine()&0x100)>>1));
++        if (r==0x19) return 0x81;
++        if (r==0x1a) return vicIrqMask;
++        return 0;
++      }
++      if (a>=0xdc00 && a<0xde00) {
++        int r=a&15;
++        long long per=(long long)ciaLatch+1;
++        int cnt=(int)(per-(cycles%per));
++        if (r==4) return (unsigned char)(cnt&0xff);
++        if (r==5) return (unsigned char)(cnt>>8);
++        if (r==0x0d) return 0x81;
++        if (r==0) return 0xff;
++        if (r==1) return 0xff;
++        return 0;
++      }
++      return 0;
++    }
++    if (a>=0xe000 && c64Kernal()) return kernal[a-0xe000];
++    return mem[a];
++  }
++
++  void c64Write(unsigned short a, unsigned char v) {
++    if (a>=0xd000 && a<0xe000 && c64IO()) {
++      if (a>=0xd400 && a<0xd800) {
++        int r=a&0x1f;
++        if (r>0x18) return;
++        sidRegs[r]=v;
++        if (r==0x18) volWrites++;
++        frameWrites.push_back(std::make_pair(0x400|r,v));
++        VGMEvent e;
++        e.time=timeNow();
++        e.reg=0x400|r;
++        e.val=v;
++        log->events.push_back(e);
++        return;
++      }
++      if (a>=0xd000 && a<0xd400) {
++        if ((a&0x3f)==0x1a) vicIrqMask=v;
++        return;
++      }
++      if (a>=0xdc00 && a<0xdd00) {
++        int r=a&15;
++        if (r==4) {
++          ciaLatch=(ciaLatch&0xff00)|v;
++          ciaLatchSet=true;
++        }
++        if (r==5) {
++          ciaLatch=(ciaLatch&0xff)|(v<<8);
++          ciaLatchSet=true;
++        }
++        if (r==0x0d) {
++          if (v&0x80) {
++            ciaMask|=v&0x1f;
++          } else {
++            ciaMask&=~(v&0x1f);
++          }
++        }
++        return;
++      }
++      return;
++    }
++    pageDirty[a>>8]=true;
++    mem[a]=v;
++  }
++
++  // the KERNAL bits music players rely on: the IRQ entry (saves the
++  // registers and jumps through $0314) and its exits
++  void c64Setup() {
++    memset(kernal,0,sizeof(kernal));
++    memset(sidRegs,0,sizeof(sidRegs));
++    memset(pageDirty,0,sizeof(pageDirty));
++    static const unsigned char irqEntry[]={0x48,0x8a,0x48,0x98,0x48,0x6c,0x14,0x03};
++    memcpy(&kernal[0xff48-0xe000],irqEntry,sizeof(irqEntry));
++    // $EA31 (the usual end of an IRQ handler) and $EA7E: acknowledge, then
++    // $EA81: restore the registers and return
++    static const unsigned char irqExit[]={0xad,0x0d,0xdc,0x68,0xa8,0x68,0xaa,0x68,0x40};
++    memcpy(&kernal[0x0a7e],irqExit,sizeof(irqExit));
++    kernal[0xea31-0xe000]=0x4c;
++    kernal[0xea32-0xe000]=0x7e;
++    kernal[0xea33-0xe000]=0xea;
++    memcpy(&kernal[0xfebc-0xe000],&irqExit[3],6);
++    // NMI: just return
++    kernal[0x1e43]=0x40;
++    kernal[0xfffa-0xe000]=0x43;
++    kernal[0xfffb-0xe000]=0xfe;
++    kernal[0x1ffe]=0x48;
++    kernal[0xffff-0xe000]=0xff;
++    mem[0x314]=0x31;
++    mem[0x315]=0xea;
++    mem[0x318]=0x43;
++    mem[0x319]=0xfe;
++  }
++
++  // runs the interrupt handler, as the CPU would (registers pushed by the
++  // handler itself, then RTI)
++  bool irq(long long maxCycles) {
++    push(retAddr>>8);
++    push(retAddr&0xff);
++    push(P&0xef);
++    P|=0x04;
++    PC=read(0xfffe)|(read(0xffff)<<8);
++    long long limit=cycles+maxCycles;
++    while (PC!=retAddr) {
++      if (cycles>=limit) {
++        S=0xfd;
++        return false;
++      }
++      step();
++    }
++    return true;
++  }
+ 
+   void mapBank(int slot, int bank) {
+     // slot 0-7: $8000-$FFFF, 8-9: $6000/$7000 (FDS)
+@@ -4355,6 +5162,7 @@ struct NSFMachine {
+   }
+ 
+   unsigned char read(unsigned short a) {
++    if (c64) return c64Read(a);
+     if (a<0x2000) return ram[a&0x7ff];
+     if (a>=0x6000) return hi[a-0x6000];
+     if (a==0x5205) return (unsigned char)((mulA*mulB)&0xff);
+@@ -4364,6 +5172,10 @@ struct NSFMachine {
+   }
+ 
+   void write(unsigned short a, unsigned char v) {
++    if (c64) {
++      c64Write(a,v);
++      return;
++    }
+     if (a<0x2000) {
+       ram[a&0x7ff]=v;
+       return;
+@@ -4460,12 +5272,16 @@ struct NSFMachine {
+ 
+   // --- 6502 ---
+   void push(unsigned char v) {
+-    ram[0x100|S]=v;
++    if (c64) {
++      mem[0x100|S]=v;
++    } else {
++      ram[0x100|S]=v;
++    }
+     S--;
+   }
+   unsigned char pull() {
+     S++;
+-    return ram[0x100|S];
++    return c64?mem[0x100|S]:ram[0x100|S];
+   }
+   void setNZ(unsigned char v) {
+     P=(P&0x7d)|(v&0x80)|((v==0)?2:0);
+@@ -4707,7 +5523,7 @@ struct NSFMachine {
+       }
+       case 0x00: {
+         // BRK: nothing to interrupt into in an NSF; treat as the end of the call
+-        PC=0x3ff0;
++        PC=retAddr;
+         break;
+       }
+       // branches
+@@ -4779,12 +5595,12 @@ struct NSFMachine {
+   // returns false if it doesn't return in time.
+   bool call(unsigned short addr, long long maxCycles) {
+     // return address: $3FF0, an address nothing else uses
+-    unsigned short ret=0x3fef;
++    unsigned short ret=retAddr-1;
+     push(ret>>8);
+     push(ret&0xff);
+     PC=addr;
+     long long limit=cycles+maxCycles;
+-    while (PC!=0x3ff0) {
++    while (PC!=retAddr) {
+       if (cycles>=limit) {
+         // fix the stack so the next call starts clean
+         S=0xfd;
+@@ -5113,9 +5929,350 @@ bool nsfRunTrack(const NSFFile& nsf, int track, int maxSeconds, VGMNESLog& log,
+ 
+ }
+ 
++// --- SID files (C64 music: PSID/RSID) ---
++
++struct SIDFile {
++  bool rsid=false;
++  int version=1;
++  unsigned short loadAddr=0, initAddr=0, playAddr=0;
++  int songs=1, start=1;
++  unsigned int speed=0;
++  unsigned short flags=0;
++  String title, artist, released;
++  std::vector<unsigned char> data;
++  bool pal=true;
++  bool is8580=false;
++  bool multiSID=false;
++};
++
++bool sidParse(const unsigned char* f, size_t len, SIDFile& sid, String& err) {
++  if (len<0x7c && len<0x76) {
++    err="file too short";
++    return false;
++  }
++  if (memcmp(f,"PSID",4)!=0 && memcmp(f,"RSID",4)!=0) {
++    err="not a SID file";
++    return false;
++  }
++  auto r16=[&](size_t p) -> unsigned short {
++    return (unsigned short)((f[p]<<8)|f[p+1]);
++  };
++  sid.rsid=(f[0]=='R');
++  sid.version=r16(4);
++  unsigned short dataOff=r16(6);
++  sid.loadAddr=r16(8);
++  sid.initAddr=r16(10);
++  sid.playAddr=r16(12);
++  sid.songs=r16(14);
++  sid.start=r16(16);
++  sid.speed=((unsigned int)f[18]<<24)|((unsigned int)f[19]<<16)|((unsigned int)f[20]<<8)|f[21];
++  sid.title=nsfString(f+0x16,32);
++  sid.artist=nsfString(f+0x36,32);
++  sid.released=nsfString(f+0x56,32);
++  if (sid.version>=2 && len>=0x78) {
++    sid.flags=r16(0x76);
++    int clk=(sid.flags>>2)&3;
++    sid.pal=(clk!=2);
++    sid.is8580=(((sid.flags>>4)&3)==2);
++    if (sid.version>=3 && len>=0x7c && (f[0x7a]!=0 || f[0x7b]!=0)) sid.multiSID=true;
++  }
++  if (sid.flags&1) {
++    err="this SID file is in Compute!'s Sidplayer format (MUS), which can't be imported";
++    return false;
++  }
++  if (dataOff>=len) {
++    err="the SID file has no data";
++    return false;
++  }
++  size_t p=dataOff;
++  if (sid.loadAddr==0) {
++    if (p+2>len) {
++      err="the SID file has no data";
++      return false;
++    }
++    sid.loadAddr=f[p]|(f[p+1]<<8);
++    p+=2;
++  }
++  sid.data.assign(f+p,f+len);
++  if ((size_t)sid.loadAddr+sid.data.size()>0x10000) sid.data.resize(0x10000-sid.loadAddr);
++  if (sid.initAddr==0) sid.initAddr=sid.loadAddr;
++  if (sid.songs<1) sid.songs=1;
++  if (sid.songs>256) sid.songs=256;
++  if (sid.start<1 || sid.start>sid.songs) sid.start=1;
++  return true;
++}
++
++// the shortest period after which the channels keep repeating (allowing a
++// few frames to differ), for programs whose memory never repeats
++static bool vgmSoundLoop(const std::vector<std::vector<unsigned long long>>& chanHash, int frames, int& loopStart, int& loopEnd, double& score) {
++  const int nGroups=(int)chanHash.size();
++  auto chanSame=[&](int g, int x, int y) -> bool {
++    for (int d=-1; d<=1; d++) {
++      int yy=y+d;
++      if (yy>=0 && yy<frames && chanHash[g][x]==chanHash[g][yy]) return true;
++    }
++    return false;
++  };
++  auto scoreL=[&](int L, double giveUp) -> double {
++    int w=std::min(frames-L-1,std::max(L,2400));
++    if (w<L) return 2.0;
++    long long bad=0, total=0;
++    for (int i=frames-L-1-w; i<frames-L-1; i+=2) {
++      for (int g=0; g<nGroups; g++) {
++        if (!chanSame(g,i,i+L)) bad++;
++      }
++      total+=nGroups;
++      if (total>=400 && (double)bad/(double)total>giveUp) return 2.0;
++    }
++    return total?((double)bad/(double)total):2.0;
++  };
++  double bestScore=2.0;
++  std::vector<std::pair<int,double>> scores;
++  for (int L=60; L*2<=frames; L++) {
++    double sc=scoreL(L,std::min(0.5,bestScore*2.0+0.05));
++    if (sc<=1.0) scores.push_back(std::make_pair(L,sc));
++    if (sc<bestScore) bestScore=sc;
++  }
++  score=bestScore;
++  if (bestScore>0.12) return false;
++  int L=0;
++  for (auto& sc: scores) {
++    if (sc.second<=bestScore+0.02) {
++      L=sc.first;
++      break;
++    }
++  }
++  const int win=120;
++  int j=frames-L-1;
++  while (j-win>=0) {
++    int bad=0;
++    for (int i=j-win; i<j; i++) {
++      for (int g=0; g<nGroups; g++) if (!chanSame(g,i,i+L)) bad++;
++    }
++    if ((double)bad/(double)(win*nGroups)>std::max(0.25,bestScore*3.0)) break;
++    j-=win;
++  }
++  while (j>0) {
++    bool ok=true;
++    for (int g=0; g<nGroups && ok; g++) if (!chanSame(g,j-1,j-1+L)) ok=false;
++    if (!ok) break;
++    j--;
++  }
++  if (frames-L-j<L) return false;
++  loopStart=j;
++  loopEnd=j+L;
++  return true;
++}
++
++bool sidRunTrack(const SIDFile& sid, int track, int maxSeconds, VGMNESLog& log, std::vector<String>& warns, String& err) {
++  NSFMachine* m=new NSFMachine;
++  std::vector<unsigned char> mem(0x10000,0);
++  m->c64=true;
++  m->mem=mem.data();
++  m->log=&log;
++  m->retAddr=0xdf00;
++  m->clock=sid.pal?985248.0:1022727.0;
++  m->linesPerFrame=sid.pal?312:263;
++  m->ciaLatch=sid.pal?0x4025:0x4295;
++  m->c64Setup();
++  memcpy(&mem[sid.loadAddr],sid.data.data(),sid.data.size());
++  unsigned int loadEnd=sid.loadAddr+(unsigned int)sid.data.size();
++  // memory map: the tune's own memory is RAM
++  if (sid.rsid) {
++    mem[1]=0x37;
++  } else if (loadEnd>0xe000) {
++    mem[1]=0x35;
++  } else if (loadEnd>0xa000 && sid.loadAddr<0xc000) {
++    mem[1]=0x36;
++  } else {
++    mem[1]=0x37;
++  }
++  mem[0]=0x2f;
++  log.clock=m->clock;
++  log.pal=sid.pal;
++  log.hasNES=false;
++  log.hasSID=true;
++  log.sid8580=sid.is8580;
++  log.sidClock=m->clock;
++
++  m->callTime=0;
++  m->callCycles=m->cycles;
++  m->A=(unsigned char)(track-1);
++  m->X=0;
++  m->Y=0;
++  m->S=0xfd;
++  m->P=0x24;
++  bool initReturned=m->call(sid.initAddr,(long long)(m->clock*4));
++  if (!initReturned && !sid.rsid) {
++    warns.push_back("the init routine of this SID did not return; the result may be wrong");
++  }
++  m->S=0xfd;
++  // how the player is called: the play routine (PSID), or the interrupt the
++  // init routine set up (RSID, or a PSID without a play address)
++  bool useIrq=sid.rsid || sid.playAddr==0;
++  bool cia;
++  if (useIrq) {
++    cia=!(m->vicIrqMask&1) && (m->ciaMask&1);
++  } else {
++    int bit=std::min(track-1,31);
++    cia=(sid.speed>>bit)&1;
++  }
++  double frameCycles=cia?(double)(m->ciaLatch+1):(sid.pal?19656.0:17095.0);
++  if (frameCycles<1000) frameCycles=1000;
++  double period=frameCycles*44100.0/m->clock;
++  double hz=m->clock/frameCycles;
++  logI("SID track %d: %s, %.3f Hz",track,useIrq?(cia?"CIA timer interrupt":"raster interrupt"):(cia?"CIA timer":"once per frame"),hz);
++  log.fixedPeriod=period;
++  log.fixedT0=0;
++  log.headerRate=(unsigned int)round(hz);
++  // whatever init wrote counts as the start of the first frame
++  for (VGMEvent& e: log.events) e.time=0;
++
++  int maxFrames=(int)((double)maxSeconds*hz);
++  if (maxFrames<60) maxFrames=60;
++  std::map<unsigned long long,int> stateSeen;
++  std::vector<unsigned long long> writeHash, soundHash;
++  std::vector<std::vector<unsigned long long>> chanHash(4);
++  std::vector<bool> audible;
++  memset(m->pageDirty,0,sizeof(m->pageDirty));
++  int loopStart=-1, loopEnd=-1, stuckAt=-1;
++  int playFails=0, digiFrames=0;
++  long long frameStart=m->cycles;
++  for (int f=0; f<maxFrames; f++) {
++    m->callTime=(double)f*period;
++    // the frame starts on time, whatever the last call took
++    m->cycles=frameStart+(long long)((double)f*frameCycles);
++    m->callCycles=m->cycles;
++    m->frameWrites.clear();
++    m->volWrites=0;
++    bool ok;
++    if (useIrq) {
++      ok=m->irq((long long)(frameCycles*2));
++    } else {
++      ok=m->call(sid.playAddr,(long long)(frameCycles*2));
++    }
++    if (!ok) playFails++;
++    if (m->volWrites>8) digiFrames++;
++    const unsigned char* sr=m->sidRegs;
++    bool aud=false;
++    for (int v=0; v<3; v++) if (sr[v*7+4]&1) aud=true;
++    audible.push_back(aud);
++    soundHash.push_back(nsfHash(sr,25));
++    unsigned long long wh=1469598103934665603ULL;
++    for (auto& w: m->frameWrites) {
++      unsigned char b2[3]={(unsigned char)w.first,(unsigned char)(w.first>>8),(unsigned char)w.second};
++      wh=nsfHash(b2,3,wh);
++    }
++    writeHash.push_back(wh);
++    for (int v=0; v<3; v++) chanHash[v].push_back(nsfHash(sr+v*7,7));
++    chanHash[3].push_back(nsfHash(sr+0x15,4));
++    // program state: the memory it writes, and the SID
++    unsigned long long h=nsfHash(sr,25);
++    for (int pg=0; pg<256; pg++) {
++      if (pg==1 || !m->pageDirty[pg]) continue;
++      h=nsfHash(&mem[pg<<8],256,h);
++    }
++    auto seen=stateSeen.find(h);
++    if (seen!=stateSeen.end()) {
++      int j=seen->second;
++      if (f-j<30) {
++        stuckAt=j;
++      } else {
++        loopStart=j;
++        loopEnd=f;
++      }
++      break;
++    }
++    stateSeen[h]=f;
++  }
++  delete m;
++  if (playFails>0) warns.push_back(fmt::sprintf("the player did not return in time %d times",playFails));
++  if (digiFrames>10) warns.push_back("this tune plays samples through the volume register (digi), which can't be imported; they are left out");
++  log.sidDigi=(digiFrames>10);
++  int frames=(int)writeHash.size();
++  if (loopStart<0 && stuckAt<0) {
++    double sc=0;
++    if (vgmSoundLoop(chanHash,frames,loopStart,loopEnd,sc)) {
++      logI("SID loop by channels: period %d frames, %.1f%% differing",loopEnd-loopStart,sc*100.0);
++    }
++  }
++  if (loopStart>=0) {
++    int L=loopEnd-loopStart;
++    for (int d=8; d>=2; d--) {
++      if (L%d!=0 || L/d<60) continue;
++      int Ld=L/d;
++      bool same=true;
++      for (int i=loopStart; i+Ld<loopEnd && same; i++) {
++        if (soundHash[i]!=soundHash[i+Ld] && writeHash[i]!=writeHash[i+Ld]) same=false;
++      }
++      if (same) {
++        L=Ld;
++        loopEnd=loopStart+L;
++        break;
++      }
++    }
++    while (loopStart>0 && (soundHash[loopStart-1]==soundHash[loopStart-1+L] || writeHash[loopStart-1]==writeHash[loopStart-1+L])) {
++      loopStart--;
++      loopEnd--;
++    }
++    bool anySound=false;
++    for (int f=loopStart; f<loopEnd && f<(int)audible.size(); f++) {
++      if (audible[f]) {
++        anySound=true;
++        break;
++      }
++    }
++    if (!anySound) {
++      stuckAt=loopStart;
++      loopStart=-1;
++    }
++  }
++  int endFrame=frames;
++  if (loopStart>=0) {
++    log.loopTime=(double)loopStart*period;
++    endFrame=loopEnd;
++    logI("SID track %d: loop at %.2fs, %.2fs long",track,(double)loopStart/hz,(double)(loopEnd-loopStart)/hz);
++  } else {
++    log.loopTime=-1;
++    int last=-1;
++    for (int f=(int)audible.size()-1; f>=0; f--) {
++      if (audible[f]) {
++        last=f;
++        break;
++      }
++    }
++    if (stuckAt>=0 && stuckAt>last) last=stuckAt;
++    if (last<0) {
++      err="this tune makes no sound";
++      return false;
++    }
++    // (and let the last notes ring out)
++    endFrame=std::min(frames,last+(int)(hz*2));
++    if (stuckAt<0 && frames>=maxFrames) {
++      warns.push_back(fmt::sprintf("track %d: no loop was found within %d seconds, so it was cut there",track,maxSeconds));
++    }
++    logI("SID track %d: no loop, %.2fs",track,(double)endFrame/hz);
++  }
++  log.endTime=(double)endFrame*period-1.0;
++  while (!log.events.empty() && log.events.back().time>log.endTime) log.events.pop_back();
++  return true;
++}
++
+ bool DivEngine::getNSFInfo(const unsigned char* file, size_t len, DivNSFInfo& info) {
+   NSFFile nsf;
+   String err;
++  if (len>=4 && (memcmp(file,"PSID",4)==0 || memcmp(file,"RSID",4)==0)) {
++    SIDFile sid;
++    if (!sidParse(file,len,sid,err)) return false;
++    info.title=sid.title;
++    info.artist=sid.artist;
++    info.copyright=sid.released;
++    info.songs=sid.songs;
++    info.start=sid.start;
++    info.pal=sid.pal;
++    info.chips=sid.is8580?"SID 8580":"SID 6581";
++    return true;
++  }
+   if (!nsfParse(file,len,nsf,err)) return false;
+   info.title=nsf.title;
+   info.artist=nsf.artist;
+@@ -5263,3 +6420,113 @@ bool DivEngine::loadNSF(unsigned char* file, size_t len) {
+   delete[] file;
+   return success;
+ }
++
++bool DivEngine::loadSID(unsigned char* file, size_t len) {
++  bool success=false;
++  warnings="";
++  try {
++    SIDFile sid;
++    String err;
++    if (!sidParse(file,len,sid,err)) {
++      lastError=err;
++      throw VGMInvalidException();
++    }
++    std::vector<int> tracks=nsfImportOptions.tracks;
++    if (tracks.empty()) tracks.push_back(sid.start);
++    int maxSeconds=CLAMP(nsfImportOptions.maxSeconds,10,1800);
++
++    DivSong ds;
++    ds.version=DIV_VERSION_NSF;
++    ds.compatFlags.resetArpPhaseOnNewNote=true;
++    ds.systemLen=1;
++    ds.system[0]=sid.is8580?DIV_SYSTEM_C64_8580:DIV_SYSTEM_C64_6581;
++    ds.systemVol[0]=1.0f;
++    ds.systemPan[0]=0.0f;
++    ds.systemFlags[0].set("clockSel",sid.pal?1:0);
++    // no hard reset before notes: the player's own register writes are
++    // imported as they are
++    ds.systemFlags[0].set("initResetTime",0);
++    // a cutoff macro only writes while it runs (once over, the pattern or
++    // another note may change the cutoff)
++    ds.systemFlags[0].set("macroRace",true);
++    // (the volume macro sets the volume of the whole chip: once over it must
++    // stop writing it, like the other macros)
++    ds.compatFlags.volMacroLinger=false;
++    ds.initDefaultSystemChans();
++    ds.name=sid.title;
++    ds.author=sid.artist;
++    ds.category=sid.title;
++    ds.notes=fmt::sprintf("Imported from SID.\nTitle: %s\nAuthor: %s\nReleased: %s",sid.title,sid.artist,sid.released);
++
++    VGMNESContext ctx;
++    int imported=0;
++    for (size_t ti=0; ti<tracks.size(); ti++) {
++      int track=tracks[ti];
++      if (track<1 || track>sid.songs) continue;
++      int tracksLeft=(int)(tracks.size()-ti);
++      ctx.shareLimit=(tracks.size()>1)?std::max(24,(256-(int)ds.ins.size())/tracksLeft):0;
++      VGMNESLog log;
++      std::vector<String> warns;
++      if (!sidRunTrack(sid,track,maxSeconds,log,warns,err)) {
++        addWarning(fmt::sprintf("track %d: %s",track,err));
++        continue;
++      }
++      DivSubSong* sub;
++      if (imported==0) {
++        sub=ds.subsong[0];
++      } else {
++        sub=new DivSubSong;
++        ds.subsong.push_back(sub);
++      }
++      String trackName=fmt::sprintf("Track %d",track);
++      sub->name=trackName;
++      ctx.gridMode=0;
++      ctx.sidFreePW=vgmPickGrid(log,ctx,ds,true);
++      ctx.gridMode=vgmPickGrid(log,ctx,ds);
++      if (!vgmConvertNES(log,ctx,ds,sub,warns,err)) {
++        addWarning(fmt::sprintf("track %d: %s",track,err));
++        if (imported>0) {
++          ds.subsong.pop_back();
++          delete sub;
++        }
++        continue;
++      }
++      for (String& w: warns) {
++        String full=(tracks.size()>1)?fmt::sprintf("%s: %s",trackName,w):w;
++        addWarning(full);
++      }
++      imported++;
++    }
++    if (imported==0) {
++      lastError=err.empty()?String("no track could be imported"):err;
++      throw VGMInvalidException();
++    }
++    if (tracks.size()==1 && sid.songs>1) ds.name=fmt::sprintf("%s - Track %d",sid.title,tracks[0]);
++
++    ds.insLen=(int)ds.ins.size();
++    ds.sampleLen=(int)ds.sample.size();
++    ds.recalcChans();
++    if (sid.multiSID) addWarning("this tune uses more than one SID; only the first one is imported");
++
++    if (active) quitDispatch();
++    BUSY_BEGIN_SOFT;
++    saveLock.lock();
++    song.unload();
++    song=ds;
++    hasLoadedSomething=true;
++    changeSong(0);
++    saveLock.unlock();
++    BUSY_END;
++    if (active) {
++      initDispatch();
++      BUSY_BEGIN;
++      renderSamples();
++      reset();
++      BUSY_END;
++    }
++    success=true;
++  } catch (VGMInvalidException& e) {
++  }
++  delete[] file;
++  return success;
++}
+diff --git a/src/gui/gui.cpp b/src/gui/gui.cpp
+index 342e378..56a6a08 100644
+--- a/src/gui/gui.cpp
++++ b/src/gui/gui.cpp
+@@ -2204,7 +2204,7 @@ void FurnaceGUI::openFileDialog(FurnaceGUIFileDialogs type) {
+       if (!dirExists(workingDirSong)) workingDirSong=getHomeDir();
+       hasOpened=fileDialog->openLoad(
+         _("Open File"),
+-        {_("compatible files"), "*.fur *.dmf *.mod *.s3m *.xm *.it *.fc13 *.fc14 *.smod *.fc *.ftm *.0cc *.dnm *.eft *.fub *.tfe *.mid *.midi *.kar *.smf *.vgm *.vgz *.nsf *.nsfe",
++        {_("compatible files"), "*.fur *.dmf *.mod *.s3m *.xm *.it *.fc13 *.fc14 *.smod *.fc *.ftm *.0cc *.dnm *.eft *.fub *.tfe *.mid *.midi *.kar *.smf *.vgm *.vgz *.nsf *.nsfe *.sid",
+          _("all files"), "*"},
+         workingDirSong,
+         dpiScale
+@@ -2952,7 +2952,7 @@ int FurnaceGUI::load(String path) {
+       return 0;
+     }
+     // an NSF holds every song of a game: ask which tracks to import first
+-    if (!nsfImportPending && len>=5 && (memcmp(file,"NESM\x1a",5)==0 || memcmp(file,"NSFE",4)==0)) {
++    if (!nsfImportPending && len>=5 && (memcmp(file,"NESM\x1a",5)==0 || memcmp(file,"NSFE",4)==0 || memcmp(file,"PSID",4)==0 || memcmp(file,"RSID",4)==0)) {
+       DivNSFInfo info;
+       if (e->getNSFInfo(file,(size_t)len,info)) {
+         delete[] file;
+@@ -8187,7 +8187,7 @@ bool FurnaceGUI::loop() {
+       if (!nsfInfo.artist.empty()) ImGui::TextWrapped("%s",nsfInfo.artist.c_str());
+       if (!nsfInfo.copyright.empty()) ImGui::TextWrapped("%s",nsfInfo.copyright.c_str());
+       ImGui::Text(_("%d tracks, %s, %s"),nsfInfo.songs,nsfInfo.chips.c_str(),nsfInfo.pal?"PAL":"NTSC");
+-      if (nsfInfo.chips!="2A03" && nsfInfo.chips!="2A03 + 5B") {
++      if (nsfInfo.chips!="2A03" && nsfInfo.chips!="2A03 + 5B" && nsfInfo.chips.find("SID")!=0) {
+         ImGui::TextWrapped(_("this NSF uses an expansion chip that can't be imported yet; only the 2A03 (and Sunsoft 5B) part is imported."));
+       }
+       ImGui::Separator();
+-- 
+2.43.0
+

@@ -49,6 +49,9 @@ public:
 
 	void sound_stream_update(s16 **outputs, s16 **channel_outputs, u32 samples);
 
+	// (for streaming: where a channel reads, 16.11 fixed point)
+	u32 get_addr(int ch) const { return m_chan[ch&7].addr; }
+
 protected:
 	rf5c68_device(int output_bits);
 

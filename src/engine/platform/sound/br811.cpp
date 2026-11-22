@@ -8,6 +8,9 @@ namespace br811 {
 // Formas de onda finais (secao 5 da especificacao).
 // A Onda A foi desenhada de 0 a 7 e sai deslocada em 1 bit (0, 12, 14).
 static const uint8_t WAVE_A[WAVE_A_STEPS] = {0, 0, 12, 14, 14, 14, 12, 0};
+// BR811 corrigido: onda quadrada verdadeira (metade alta, metade baixa), com o
+// mesmo pico da Onda A original para manter o equilibrio com a Onda B.
+static const uint8_t WAVE_A_SQUARE[WAVE_A_STEPS] = {0, 0, 14, 14, 14, 14, 0, 0};
 static const uint8_t WAVE_B[WAVE_B_STEPS] = {0, 0, 15, 15, 15, 15, 15, 15,
                                              15, 0, 0, 0, 15, 15, 0, 0};
 
@@ -19,6 +22,22 @@ static constexpr int64_t PCM_UNITS_PER_PERIOD =
 
 // Nivel maximo de um canal (onda 15 * volume 15), usado para normalizar a mistura.
 static constexpr float CHANNEL_MAX = 15.0f * VOLUME_MAX;
+
+// A saida de cada canal e centrada em zero (onda de -7,5 a +7,5) e a mistura
+// recebe este ganho (+6 dB), acompanhando o aumento de volume do BR1611 para
+// manter o equilibrio entre os dois chips no Ompreza 2. Vale para o BR811 e o
+// BR411. Quando todos os canais estao no maximo juntos (ou o PCM passa de 15
+// no PCM Volume Plus), um limitador suave segura a saida em vez de cortar seco.
+static constexpr float WAVE_CENTER = 7.5f;
+static constexpr double OUTPUT_GAIN = 2.0;
+
+static double softLimit(double x) {
+    const double T = 0.75;
+    const double a = std::fabs(x);
+    if (a <= T) return x;
+    const double y = T + (1.0 - T) * std::tanh((a - T) / (1.0 - T));
+    return x < 0 ? -y : y;
+}
 
 // ---------------------------------------------------------------------------
 // Utilitarios de afinacao
@@ -37,14 +56,38 @@ int periodForMidi(int midiNote) {
 // Chip
 // ---------------------------------------------------------------------------
 Chip::Chip(double sampleRate) : sampleRate_(sampleRate) {
-    unitsPerSample_ = (CLOCK_HZ / sampleRate_) * UNITS_PER_CLOCK;
+    unitsPerSample_ = (clockHz_ / sampleRate_) * UNITS_PER_CLOCK;
     reset();
 }
 
 void Chip::setSampleRate(double sampleRate) {
     sampleRate_ = sampleRate;
-    unitsPerSample_ = (CLOCK_HZ / sampleRate_) * UNITS_PER_CLOCK;
+    unitsPerSample_ = (clockHz_ / sampleRate_) * UNITS_PER_CLOCK;
 }
+
+void Chip::setVariant(Variant v) {
+    variant_ = v;
+    if (v == VARIANT_BR411) {
+        clockHz_ = BR411_CLOCK_HZ;
+        divisor_ = BR411_DIVISOR;
+        numCh_   = BR411_NUM_CHANNELS;
+        pcmVolumePlus_ = false;  // o BR411 nao tem PCM
+        squareWaveA_ = false;    // nem a versao corrigida da Onda A
+    } else {
+        clockHz_ = CLOCK_HZ;
+        divisor_ = DIVISOR;
+        numCh_   = NUM_CHANNELS;
+    }
+    unitsPerSample_ = (clockHz_ / sampleRate_) * UNITS_PER_CLOCK;
+    reset();
+}
+
+// Divisores do ruido, na ordem do enum NoiseRate (0..5).
+// BR811: potencias de 2 do clock de 6,42 MHz.
+// BR411: escolhidos para dar as mesmas taxas em Hz com o clock de 5 MHz
+// (12.500, 6.250, 3.125, -, 25.000 e 50.000 Hz).
+static const int64_t NOISE_DIV_BR811[6] = {512, 1024, 2048, 0, 256, 128};
+static const int64_t NOISE_DIV_BR411[6] = {400,  800, 1600, 0, 200, 100};
 
 void Chip::reset() {
     for (int i = 0; i < NUM_CHANNELS; i++) {
@@ -63,18 +106,17 @@ int64_t Chip::stepPeriod(const Channel& c, int index) const {
     const int64_t p1 = static_cast<int64_t>(c.period) + 1;
     switch (c.mode) {
         case MODE_WAVE_A:
-            return DIVISOR * p1 * UNITS_PER_CLOCK / WAVE_A_STEPS;  // 7,125 clocks * (P+1)
+            // BR811: 7,125 clocks * (P+1); BR411: 8 clocks * (P+1)
+            return divisor_ * p1 * UNITS_PER_CLOCK / WAVE_A_STEPS;
         case MODE_WAVE_B:
-            return DIVISOR * p1 * UNITS_PER_CLOCK / WAVE_B_STEPS;  // 3,5625 clocks * (P+1)
-        case MODE_NOISE:
-            switch (c.noiseRate) {
-                case NOISE_DIV1024: return 1024 * UNITS_PER_CLOCK;
-                case NOISE_DIV2048: return 2048 * UNITS_PER_CLOCK;
-                case NOISE_LINKED:  return DIVISOR * p1 * UNITS_PER_CLOCK;  // vinculado
-                case NOISE_DIV256:  return 256 * UNITS_PER_CLOCK;
-                case NOISE_DIV128:  return 128 * UNITS_PER_CLOCK;
-                default:            return 512 * UNITS_PER_CLOCK;  // NOISE_DIV512 e codigos reservados
-            }
+            return divisor_ * p1 * UNITS_PER_CLOCK / WAVE_B_STEPS;  // 3,5625 clocks * (P+1)
+        case MODE_NOISE: {
+            if (c.noiseRate == NOISE_LINKED) return divisor_ * p1 * UNITS_PER_CLOCK;  // vinculado
+            // codigos reservados (6 e 7) agem como o codigo 0
+            const int rate = (c.noiseRate <= NOISE_DIV128) ? static_cast<int>(c.noiseRate) : static_cast<int>(NOISE_DIV512);
+            const int64_t* table = (variant_ == VARIANT_BR411) ? NOISE_DIV_BR411 : NOISE_DIV_BR811;
+            return table[rate] * UNITS_PER_CLOCK;
+        }
         case MODE_PCM:
             if (index == PCM_CHANNEL) return PCM_UNITS_PER_PERIOD * p1;
             break;
@@ -86,13 +128,13 @@ int64_t Chip::stepPeriod(const Channel& c, int index) const {
 float Chip::level(const Channel& c, int index) const {
     float v = 0.0f;
     switch (c.mode) {
-        case MODE_WAVE_A: v = WAVE_A[c.step]; break;
-        case MODE_WAVE_B: v = WAVE_B[c.step]; break;
-        case MODE_NOISE:  v = (c.lfsr & 1) ? 15.0f : 0.0f; break;
+        case MODE_WAVE_A: v = (squareWaveA_ ? WAVE_A_SQUARE[c.step] : WAVE_A[c.step]) - WAVE_CENTER; break;
+        case MODE_WAVE_B: v = WAVE_B[c.step] - WAVE_CENTER; break;
+        case MODE_NOISE:  v = (c.lfsr & 1) ? WAVE_CENTER : -WAVE_CENTER; break;
         case MODE_PCM:
             if (index == PCM_CHANNEL) {
                 // PCM parado fica no ponto medio (silencio), sem estalo no fim do sample
-                v = (pcm_.playing ? pcm_.sample : 64) * (15.0f / 127.0f);
+                v = pcm_.playing ? (pcm_.sample - 63.5f) * (15.0f / 127.0f) : 0.0f;
             }
             break;
     }
@@ -138,11 +180,14 @@ double Chip::runChannel(Channel& c, int index, int64_t dt) {
 }
 
 void Chip::write(int channel, int reg, uint8_t value) {
-    if (channel < 0 || channel >= NUM_CHANNELS) return;
+    if (channel < 0 || channel >= numCh_) return;
     Channel& c = ch_[channel];
     switch (reg) {
         case 0: {
-            const uint8_t newMode = (value >> 6) & 3;
+            uint8_t newMode = (value >> 6) & 3;
+            // BR411: nao tem o circuito da Onda B nem o PCM, e o bit 0 do modo
+            // nem chega ao chip: modo 1 (Onda B) toca a Onda A e modo 3 (PCM) toca ruido
+            if (variant_ == VARIANT_BR411) newMode &= 2;
             // volume de 4 bits (0-15); o PCM do canal 5 usa 5 bits (0-30) quando
             // o chip de cartucho PCM Volume Plus esta presente
             c.volume = (pcmVolumePlus_ && newMode == MODE_PCM && channel == PCM_CHANNEL)
@@ -164,6 +209,7 @@ void Chip::write(int channel, int reg, uint8_t value) {
 }
 
 void Chip::writePcm(int reg, uint8_t value) {
+    if (variant_ != VARIANT_BR811) return;  // o BR411 nao tem PCM
     switch (reg) {
         case PCM_ADDR_LO: pcm_.addr = static_cast<uint16_t>((pcm_.addr & 0xFF00) | value); break;
         case PCM_ADDR_HI: pcm_.addr = static_cast<uint16_t>((pcm_.addr & 0x00FF) | (value << 8)); break;
@@ -213,15 +259,15 @@ void Chip::render(float* out, int numSamples, float* const* perChannel) {
         unitsAccum_ -= static_cast<double>(dt);
 
         double mix = 0.0;
-        for (int c = 0; c < NUM_CHANNELS; c++) {
+        for (int c = 0; c < numCh_; c++) {
             const double v = runChannel(ch_[c], c, dt) / static_cast<double>(dt);
             mix += v;
             // o PCM com volume acima de 15 passa de 1,0; limita para o osciloscopio
-            if (perChannel) perChannel[c][i] = static_cast<float>(std::min(v / CHANNEL_MAX, 1.99));
+            if (perChannel) perChannel[c][i] = static_cast<float>(std::max(std::min(v / (CHANNEL_MAX * 0.5), 1.99), -1.99));
         }
         totalUnits_ += dt;
-        // satura em 1,0 (o PCM com volume acima de 15 pode passar da escala)
-        out[i] = static_cast<float>(std::min(mix / (NUM_CHANNELS * CHANNEL_MAX), 1.0));
+        // mesma escala no BR811 e no BR411, com limitador suave
+        out[i] = static_cast<float>(softLimit(mix * OUTPUT_GAIN / (NUM_CHANNELS * CHANNEL_MAX)));
     }
 }
 

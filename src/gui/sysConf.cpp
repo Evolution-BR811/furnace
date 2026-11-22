@@ -1225,6 +1225,14 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
     }
     case DIV_SYSTEM_BR811: {
       bool pcmVolumePlus=flags.getBool("pcmVolumePlus",false);
+      bool squareWaveA=flags.getBool("squareWaveA",false);
+
+      if (ImGui::Checkbox(_("\"Corrected\" BR811 (Wave A as a true square wave)"),&squareWaveA)) {
+        altered=true;
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(_("the BR811 as it should have been: Wave A becomes a true 50%% square wave instead of the original shape that came out of a design mistake."));
+      }
 
       if (ImGui::Checkbox(_("PCM Volume Plus (fictional cartridge chip)"),&pcmVolumePlus)) {
         altered=true;
@@ -1236,10 +1244,16 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
       if (altered) {
         e->lockSave([&]() {
           flags.set("pcmVolumePlus",pcmVolumePlus);
+          flags.set("squareWaveA",squareWaveA);
         });
       }
 
       // o clock do BR811 e fixo (o da CPU RS04)
+      supportsCustomRate=false;
+      break;
+    }
+    case DIV_SYSTEM_BR411: {
+      // o clock do BR411 e fixo (o da CPU RS04L do Ompreza P)
       supportsCustomRate=false;
       break;
     }
@@ -1672,11 +1686,20 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
         altered=true;
       }
       ImGui::Unindent();
+      bool streaming=flags.getBool("streaming",false);
+      if (ImGui::Checkbox(_("Stream samples (no 64KB limit)"),&streaming)) {
+        altered=true;
+        mustRender=true;
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(_("each channel plays through a ring buffer of its own (8KB), filled from the sample as it plays, like the Sega CD's sound drivers do.\nsamples can be as long as needed, but the memory can't hold anything else."));
+      }
 
       if (altered) {
         e->lockSave([&]() {
           flags.set("clockSel",clockSel);
           flags.set("chipType",chipType);
+          flags.set("streaming",streaming);
         });
       }
       break;
@@ -2056,6 +2079,41 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
       }
       break;
     }
+    case DIV_SYSTEM_PWM_32X: {
+      supportsCustomRate=false;
+      int clockSel=flags.getInt("clockSel",0);
+      int cycle=flags.getInt("cycle",1047);
+
+      ImGui::Text(_("Clock rate:"));
+      ImGui::Indent();
+      if (ImGui::RadioButton(_("23.01MHz (NTSC)"),clockSel==0)) {
+        clockSel=0;
+        altered=true;
+      }
+      if (ImGui::RadioButton(_("22.80MHz (PAL)"),clockSel==1)) {
+        clockSel=1;
+        altered=true;
+      }
+      ImGui::Unindent();
+      ImGui::Text(_("Cycle register:"));
+      if (CWSliderInt("##PWMCycle",&cycle,256,4095)) {
+        if (cycle<256) cycle=256;
+        if (cycle>4095) cycle=4095;
+        altered=true;
+      } rightClickable
+      {
+        const double clk=(clockSel==1)?22801467.0:23011361.0;
+        ImGui::Text(_("rate: %.0f Hz, %d levels"),clk/(double)(cycle-1),cycle+1);
+      }
+
+      if (altered) {
+        e->lockSave([&]() {
+          flags.set("clockSel",clockSel);
+          flags.set("cycle",cycle);
+        });
+      }
+      break;
+    }
     case DIV_SYSTEM_PCM_DAC: {
       supportsCustomRate=false;
       // default to 44100Hz 16-bit stereo
@@ -2152,6 +2210,8 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
       bool echo=flags.getBool("echo",false);
       int echoVolL=flags.getInt("echoVolL",127);
       int echoVolR=flags.getInt("echoVolR",127);
+      int dryVolL=flags.getInt("dryVolL",127);
+      int dryVolR=flags.getInt("dryVolR",127);
       int echoDelay=flags.getInt("echoDelay",0)&15;
       int echoFeedback=flags.getInt("echoFeedback",0);
       int echoMask=flags.getInt("echoMask",0);
@@ -2178,6 +2238,18 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
       if (CWSliderInt(_("Right##VolScaleL"),&vsR,0,127)) {
         if (vsR<0) vsR=0;
         if (vsR>127) vsR=127;
+        altered=true;
+      } rightClickable
+
+      ImGui::Text(_("Main volume (MVOL):"));
+      if (CWSliderInt(_("Left##DryVolL"),&dryVolL,-128,127)) {
+        if (dryVolL<-128) dryVolL=-128;
+        if (dryVolL>127) dryVolL=127;
+        altered=true;
+      } rightClickable
+      if (CWSliderInt(_("Right##DryVolR"),&dryVolR,-128,127)) {
+        if (dryVolR<-128) dryVolR=-128;
+        if (dryVolR>127) dryVolR=127;
         altered=true;
       } rightClickable
 
@@ -2299,6 +2371,8 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
           flags.set("echo",echo);
           flags.set("echoVolL",echoVolL);
           flags.set("echoVolR",echoVolR);
+          flags.set("dryVolL",dryVolL);
+          flags.set("dryVolR",dryVolR);
           flags.set("echoDelay",echoDelay);
           flags.set("echoFeedback",echoFeedback);
           flags.set("echoFilter0",echoFilter[0]);

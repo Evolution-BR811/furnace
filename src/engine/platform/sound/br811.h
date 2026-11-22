@@ -1,4 +1,5 @@
 // BR811 - nucleo de emulacao do chip de som do console ficticio Ompreza (1984)
+// Tambem emula o BR411, a variante capada do portatil Ompreza P (1988).
 //
 // Nucleo independente, sem dependencia do Furnace Tracker. A ideia e plugar
 // esta classe depois na camada "platform" do Furnace (ver passo 4 do roteiro).
@@ -19,6 +20,25 @@ constexpr int     DIVISOR       = 57;         // divisor de afinacao (era 114: d
 constexpr int     MAX_PERIOD    = 4095;       // periodo de 12 bits
 constexpr int     VOLUME_MAX    = 15;         // volume de 0 a 15
 constexpr int     PCM_VOLUME_MAX = 30;        // PCM (canal 5) com o chip de cartucho PCM Volume Plus: volume de 0 a 30
+
+// ---------------------------------------------------------------------------
+// BR411 (Ompreza P, 1988): variante capada do BR811, por Evolution BR811
+//   - 4 canais, sem Onda B e sem PCM (o bit 0 do campo de modo e ignorado:
+//     modo 1 vira Onda A e modo 3 vira ruido)
+//   - clock 5,00 MHz (o mesmo da CPU RS04L)
+//   - divisor de afinacao 64: um prescaler barato de potencia de 2 no lugar
+//     do divisor 57. Corte de custos que deixa o chip um pouco mais
+//     desafinado que o BR811 nos agudos (de proposito)
+//   - ruido com divisores 100/200/400/800/1600: as mesmas taxas em Hz do BR811
+// ---------------------------------------------------------------------------
+constexpr double  BR411_CLOCK_HZ     = 5000000.0;
+constexpr int     BR411_NUM_CHANNELS = 4;
+constexpr int     BR411_DIVISOR      = 64;
+
+enum Variant : uint8_t {
+    VARIANT_BR811 = 0,
+    VARIANT_BR411 = 1,
+};
 
 constexpr int     WAVE_A_STEPS  = 8;
 constexpr int     WAVE_B_STEPS  = 16;
@@ -94,17 +114,27 @@ public:
     void setRomReader(RomReader reader) { rom_ = std::move(reader); }
     // Chip de cartucho "PCM Volume Plus": libera o volume 0-30 no PCM do canal 5.
     // Sem ele (padrao), o PCM tem volume 0-15 como os outros canais.
-    void setPcmVolumePlus(bool present) { pcmVolumePlus_ = present; }
+    void setPcmVolumePlus(bool present) { pcmVolumePlus_ = present && variant_ == VARIANT_BR811; }
+    // "BR811 corrigido": a Onda A vira a onda quadrada de verdade (50%) que o
+    // chip deveria ter tido na historia ficticia. So afeta o BR811.
+    void setSquareWaveA(bool square) { squareWaveA_ = square && variant_ == VARIANT_BR811; }
+    bool squareWaveA() const { return squareWaveA_; }
+
+    // Escolhe o chip emulado: BR811 (padrao) ou BR411. Reinicia o chip.
+    void setVariant(Variant v);
+    Variant variant() const { return variant_; }
+    int numChannels() const { return numCh_; }
+    double clockHz() const { return clockHz_; }
     bool pcmVolumePlus() const { return pcmVolumePlus_; }
 
-    // Escrita nos registradores de um canal (channel 0..4, reg 0..2).
+    // Escrita nos registradores de um canal (channel 0..4, reg 0..2; no BR411, 0..3).
     void write(int channel, int reg, uint8_t value);
-    // Escrita nos registradores do PCM (reg = PcmReg).
+    // Escrita nos registradores do PCM (reg = PcmReg). Ignorada no BR411.
     void writePcm(int reg, uint8_t value);
 
     // Gera numSamples amostras mono, em float de 0.0 a 1.0 (sinal unipolar,
     // como sai do chip; remova o nivel DC ao gravar em arquivo).
-    // Se perChannel for informado (array de NUM_CHANNELS ponteiros), cada canal
+    // Se perChannel for informado (array de numChannels() ponteiros), cada canal
     // tambem recebe a propria saida, de 0.0 a 1.0 (usado nos osciloscopios do Furnace).
     void render(float* out, int numSamples, float* const* perChannel = nullptr);
 
@@ -156,6 +186,13 @@ private:
     Pcm      pcm_;
     RomReader rom_;
     bool      pcmVolumePlus_ = false;
+    bool      squareWaveA_ = false;
+
+    // variante emulada (BR811 ou BR411)
+    Variant  variant_  = VARIANT_BR811;
+    double   clockHz_  = CLOCK_HZ;
+    int      divisor_  = DIVISOR;
+    int      numCh_    = NUM_CHANNELS;
 };
 
 }  // namespace br811

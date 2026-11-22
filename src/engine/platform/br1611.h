@@ -24,13 +24,14 @@
 #include "sound/br1611.h"
 
 // BR1611: chip de som do console ficticio Ompreza 2 (1989), por Evolution BR811.
-// 7 canais de sintese WMS (4 operadores somados, cada um com sua propria onda).
+// 7 canais de sintese WMS: 4 operadores com os algoritmos e o feedback do OPN,
+// cada um com a sua propria onda (guardada no instrumento).
 // Os canais 6 e 7 podem tocar PCM (16, 8 ou 4 bits, ou CP) a partir da ROM do cartucho.
 class DivPlatformBR1611: public DivDispatch {
   struct Channel: public SharedChannel {
     int pan;          // posicao estereo: 0 esq, 1 meio-esq, 2 centro, 3 meio-dir, 4 dir
     int fms;          // profundidade do vibrato (0-7)
-    int waves[4];     // onda (wavetable da musica) de cada operador
+    int opMask;       // operadores que tocam (bits na ordem OP1-OP4)
     bool pcm;         // canais 6 e 7: tocando sample
     int sample;       // canais 6 e 7: numero do sample
     DivInstrumentFM state;
@@ -38,9 +39,9 @@ class DivPlatformBR1611: public DivDispatch {
       SharedChannel(127,linear),
       pan(2),
       fms(0),
+      opMask(15),
       pcm(false),
       sample(-1) {
-      for (int i=0; i<4; i++) waves[i]=-1;
     }
   };
   Channel chan[7];
@@ -64,11 +65,13 @@ class DivPlatformBR1611: public DivDispatch {
   DivMemoryComposition memCompo;
 
   void writeReg(int page, int addr, unsigned char val);
-  void uploadWave(int ch, int op, int waveIndex);
+  void uploadWave(int ch, int op, const DivInstrumentBR1611* src);
+  void uploadWaves(int ch);
   void commitOps(int ch);
   void commitChannel(int ch);
   void commitFreq(int ch);
   void setupPcm(int ch);
+  int keyMask(int ch);
   void keyOn(int ch);
   void keyOff(int ch);
 

@@ -10,7 +10,9 @@
 //      ex.: Lá 0 (27,5 Hz) = fnum 1802 no bloco 0; Lá 4 (440 Hz) = fnum 1802 no bloco 4
 //  - Ondas: 28 slots de 256 bytes, slot = canal * 4 + operador
 //      cada byte é 0-255 com centro em 128 (igual ao wavetable do Furnace)
-//  - Operadores somados (sem algoritmo e sem feedback)
+//  - 4 operadores com os 8 algoritmos e o feedback do OPN (YM2612): cada
+//    operador modula a fase do seguinte, mas toca a sua propria onda
+//  - LFO unico: vibrato (FMS) e tremolo (AMS + bit AM de cada operador)
 //  - PCM: C-4 toca o sample a 32.000 Hz; endereços de 24 bits em little-endian
 //  - Envelope do PCM: registradores do operador 1 (op 0) do canal
 //  - CP: blocos de 9 bytes (cabeçalho + 16 amostras de 4 bits), mesmo layout
@@ -84,7 +86,8 @@ private:
   void keyOnOp(int ch, int o);
   void keyOffOp(int ch, int o);
   void envUpdate(Op& p, int ar, int d1, int d2, int rr, int sl, int rs, int kc, int ssg);
-  int32_t opStep(int ch, int o, int fn, int blk, double vib, int kc);
+  int32_t opStep(int ch, int o, int fn, int blk, double vib, int kc, int32_t mod, int amAtt);
+  int32_t fbHist[CHANNELS][2]; // feedback: as duas ultimas saidas do operador 1
   int32_t pcmStep(int ch, int fn, int blk, double vib, int kc);
   int32_t pcmFetch(int ch, int fmt, uint32_t start, uint32_t idx);
   uint8_t memAt(uint32_t addr) const;

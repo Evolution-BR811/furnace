@@ -51,6 +51,7 @@ const char* regCheatSheetBR1611[]={
   "Block_FreqHigh_x", "010",
   "Volume_x", "018",
   "FMS_Pan_x", "020",
+  "FB_ALG_x", "028",
   "PCM6_Start", "030",
   "PCM6_Loop", "033",
   "PCM6_End", "036",
@@ -59,6 +60,7 @@ const char* regCheatSheetBR1611[]={
   "PCM7_Loop", "043",
   "PCM7_End", "046",
   "PCM7_Control", "049",
+  "AMS_x", "050",
   "DT_MULT_xy", "100",
   "TL_xy", "120",
   "RS_AR_xy", "140",
@@ -78,30 +80,27 @@ void DivPlatformBR1611::writeReg(int page, int addr, unsigned char val) {
   chip.write(page,addr,val);
 }
 
-// manda uma wavetable da musica para o slot de onda do operador (256 pontos de 8 bits)
-void DivPlatformBR1611::uploadWave(int ch, int op, int waveIndex) {
-  chan[ch].waves[op]=waveIndex;
+// manda a onda de um operador (guardada no instrumento) para o slot de onda
+// do chip, reamostrada para 256 pontos de 8 bits. sem instrumento: senoide
+void DivPlatformBR1611::uploadWave(int ch, int op, const DivInstrumentBR1611* src) {
   unsigned char data[256];
-  DivWavetable* w=NULL;
-  if (parent->song.waveLen>0) w=parent->getWave(waveIndex);
-  if (w==NULL || w->len<1 || w->max<1) {
-    // sem wavetable na musica: usa uma senoide
+  int len=(src==NULL)?0:CLAMP(src->waveLen[op],1,256);
+  if (len<1) {
     for (int i=0; i<256; i++) {
       data[i]=(unsigned char)round(128.0+127.0*sin(2.0*3.14159265358979323846*(double)i/256.0));
     }
+  } else if (len==256) {
+    memcpy(data,src->waveData[op],256);
   } else {
     for (int i=0; i<256; i++) {
-      // reamostra a onda para 256 pontos (interpolacao linear, em ciclo)
-      double pos=(double)i*(double)w->len/256.0;
+      // reamostra para 256 pontos (interpolacao linear, em ciclo)
+      double pos=(double)i*(double)len/256.0;
       int a=(int)pos;
       double frac=pos-(double)a;
-      int b=(a+1)%w->len;
-      a%=w->len;
-      double v=(double)w->data[a]*(1.0-frac)+(double)w->data[b]*frac;
-      int out=(int)round(v*255.0/(double)w->max);
-      if (out<0) out=0;
-      if (out>255) out=255;
-      data[i]=out;
+      int b=(a+1)%len;
+      a%=len;
+      double v=(double)src->waveData[op][a]*(1.0-frac)+(double)src->waveData[op][b]*frac;
+      data[i]=(unsigned char)CLAMP((int)round(v),0,255);
     }
   }
   writeReg(0,0x04,ch*4+op);
@@ -111,15 +110,25 @@ void DivPlatformBR1611::uploadWave(int ch, int op, int waveIndex) {
   }
 }
 
+// as 4 ondas do instrumento do canal
+void DivPlatformBR1611::uploadWaves(int ch) {
+  if (chan[ch].pcm) return;
+  DivInstrument* ins=parent->getIns(chan[ch].ins,DIV_INS_BR1611);
+  const DivInstrumentBR1611* src=(ins->type==DIV_INS_BR1611)?&ins->br1611:NULL;
+  for (int j=0; j<4; j++) uploadWave(ch,j,src);
+}
+
 // escreve os 4 operadores do canal (pagina 1)
 void DivPlatformBR1611::commitOps(int ch) {
   for (int j=0; j<4; j++) {
     DivInstrumentFM::Operator& op=chan[ch].state.op[j];
     int i=j*8+ch;
-    writeReg(1,0x00+i,((op.dt&7)<<4)|(op.mult&15));
+    // (detune como no OPN: 3 e o centro)
+    static const unsigned char dtReg[8]={7,6,5,0,1,2,3,4};
+    writeReg(1,0x00+i,(dtReg[op.dt&7]<<4)|(op.mult&15));
     writeReg(1,0x20+i,(isMuted[ch] || !op.enable)?127:(op.tl&127));
     writeReg(1,0x40+i,((op.rs&3)<<6)|(op.ar&31));
-    writeReg(1,0x60+i,op.dr&31);
+    writeReg(1,0x60+i,(op.dr&31)|(op.am?0x80:0));
     writeReg(1,0x80+i,op.d2r&31);
     writeReg(1,0xa0+i,((op.sl&15)<<4)|(op.rr&15));
     writeReg(1,0xc0+i,op.ssgEnv&15);
@@ -135,6 +144,9 @@ void DivPlatformBR1611::commitChannel(int ch) {
   if (pan<0 || pan>4) pan=2;
   writeReg(0,0x18+ch,vol);
   writeReg(0,0x20+ch,((chan[ch].fms&7)<<4)|pan);
+  // algoritmo e feedback, profundidade do tremolo
+  writeReg(0,0x28+ch,(chan[ch].state.alg&7)|((chan[ch].state.fb&7)<<3));
+  writeReg(0,0x50+ch,chan[ch].state.ams&3);
 }
 
 // converte W (fnum << bloco) para fnum de 11 bits + bloco de 3 bits
@@ -174,15 +186,23 @@ void DivPlatformBR1611::setupPcm(int ch) {
   writeReg(0,base+9,ctrl);
 }
 
-void DivPlatformBR1611::keyOn(int ch) {
+int DivPlatformBR1611::keyMask(int ch) {
   int mask=0;
   if (chan[ch].pcm) {
     mask=1; // no PCM, o operador 1 dispara o sample e da o envelope
   } else {
+    // (a mascara de operadores vem na ordem OP1-OP4; os registradores
+    // estao na ordem OP1, OP3, OP2, OP4)
+    static const int dispBit[4]={0,2,1,3};
     for (int j=0; j<4; j++) {
-      if (chan[ch].state.op[j].enable) mask|=(1<<j);
+      if (chan[ch].state.op[j].enable && (chan[ch].opMask&(1<<dispBit[j]))) mask|=(1<<j);
     }
   }
+  return mask;
+}
+
+void DivPlatformBR1611::keyOn(int ch) {
+  int mask=keyMask(ch);
   // solta antes, para o envelope recomecar do ataque
   writeReg(0,0x01,ch);
   writeReg(0,0x01,(mask<<4)|ch);
@@ -249,6 +269,28 @@ void DivPlatformBR1611::tick(bool sysTick) {
       chan[i].fms=chan[i].std.fms.val&7;
       chanDirty=true;
     }
+    if (chan[i].std.alg.had) {
+      chan[i].state.alg=chan[i].std.alg.val&7;
+      chanDirty=true;
+    }
+    if (chan[i].std.fb.had) {
+      chan[i].state.fb=chan[i].std.fb.val&7;
+      chanDirty=true;
+    }
+    if (chan[i].std.ams.had) {
+      chan[i].state.ams=chan[i].std.ams.val&3;
+      chanDirty=true;
+    }
+    // velocidade do LFO (0 desliga; 1-8 liga com a velocidade 0-7), como no OPN
+    if (chan[i].std.ex3.had) {
+      lfo=(chan[i].std.ex3.val>0 && chan[i].std.ex3.val<=8)?(8|((chan[i].std.ex3.val-1)&7)):0;
+      writeReg(0,0x00,lfo);
+    }
+    if (chan[i].std.ex4.had) {
+      chan[i].opMask=chan[i].std.ex4.val&15;
+      // (sem recomecar a nota: so liga ou solta os operadores que mudaram)
+      if (chan[i].active && !chan[i].keyOn) writeReg(0,0x01,(keyMask(i)<<4)|i);
+    }
     if (chan[i].std.phaseReset.had) {
       if (chan[i].std.phaseReset.val==1 && chan[i].active) {
         chan[i].keyOn=true;
@@ -269,9 +311,7 @@ void DivPlatformBR1611::tick(bool sysTick) {
       if (m.mult.had) { op.mult=m.mult.val; opsDirty=true; }
       if (m.dt.had) { op.dt=m.dt.val; opsDirty=true; }
       if (m.ssg.had) { op.ssgEnv=m.ssg.val; opsDirty=true; }
-      if (m.ws.had && !chan[i].pcm) {
-        if (chan[i].waves[j]!=m.ws.val) uploadWave(i,j,m.ws.val);
-      }
+      if (m.am.had) { op.am=m.am.val; opsDirty=true; }
     }
 
     if (opsDirty) commitOps(i);
@@ -346,11 +386,15 @@ int DivPlatformBR1611::dispatch(DivCommand c) {
           op.tl=0; op.ar=31; op.dr=0; op.sl=0; op.d2r=0; op.rr=15; op.ssgEnv=0; op.rs=0;
         }
         chan[c.chan].fms=chan[c.chan].state.fms&7;
-        if (!chan[c.chan].pcm) {
-          for (int j=0; j<4; j++) {
-            uploadWave(c.chan,j,(ins->type==DIV_INS_BR1611)?ins->br1611.wave[j]:0);
-          }
+        if (chan[c.chan].pcm) {
+          // (o PCM so usa o envelope do operador 1)
+          chan[c.chan].state.alg=7;
+          chan[c.chan].state.fb=0;
+          chan[c.chan].state.ams=0;
+        } else {
+          uploadWaves(c.chan);
         }
+        chan[c.chan].opMask=15;
         commitOps(c.chan);
         chan[c.chan].insChanged=false;
       }
@@ -375,7 +419,16 @@ int DivPlatformBR1611::dispatch(DivCommand c) {
       chan[c.chan].macroInit(NULL);
       break;
     case DIV_CMD_NOTE_OFF_ENV:
+      // "===" (note release): solta a nota como no FM e no SNES. Os operadores
+      // (ou o PCM) entram no release do envelope e as macros seguem para a
+      // parte de release, sem reiniciar.
+      chan[c.chan].active=false;
+      chan[c.chan].keyOff=true;
+      chan[c.chan].keyOn=false;
+      chan[c.chan].std.release();
+      break;
     case DIV_CMD_ENV_RELEASE:
+      // "REL": so as macros entram em release; a nota continua soando
       chan[c.chan].std.release();
       break;
     case DIV_CMD_INSTRUMENT:
@@ -413,18 +466,65 @@ int DivPlatformBR1611::dispatch(DivCommand c) {
       commitChannel(c.chan);
       break;
     }
-    case DIV_CMD_FM_LFO: // efeito 10xx: 0 desliga; 1 a 8 liga com a velocidade 0 a 7
-      if (c.value<=0) {
-        lfo=0;
-      } else {
-        lfo=8|((c.value-1)&7);
-      }
+    case DIV_CMD_FM_LFO: // efeito 10xy, como no OPN: x liga, y velocidade (0-7)
+      lfo=((c.value>>4)?8:0)|(c.value&7);
       writeReg(0,0x00,lfo);
       break;
-    case DIV_CMD_FM_FMS: // efeito 11xx: profundidade do vibrato (0-7)
+    case DIV_CMD_FM_FMS:
       chan[c.chan].fms=c.value&7;
       commitChannel(c.chan);
       break;
+    case DIV_CMD_FM_AMS:
+      chan[c.chan].state.ams=c.value&3;
+      commitChannel(c.chan);
+      break;
+    case DIV_CMD_FM_FB:
+      chan[c.chan].state.fb=c.value&7;
+      commitChannel(c.chan);
+      break;
+    case DIV_CMD_FM_ALG:
+      chan[c.chan].state.alg=c.value&7;
+      commitChannel(c.chan);
+      break;
+    case DIV_CMD_FM_OPMASK:
+      chan[c.chan].opMask=c.value&15;
+      if (chan[c.chan].active && !chan[c.chan].keyOn) writeReg(0,0x01,(keyMask(c.chan)<<4)|c.chan);
+      break;
+    case DIV_CMD_FM_TL:
+    case DIV_CMD_FM_MULT:
+    case DIV_CMD_FM_AR:
+    case DIV_CMD_FM_DR:
+    case DIV_CMD_FM_D2R:
+    case DIV_CMD_FM_SL:
+    case DIV_CMD_FM_RR:
+    case DIV_CMD_FM_DT:
+    case DIV_CMD_FM_RS:
+    case DIV_CMD_FM_AM:
+    case DIV_CMD_FM_SSG: {
+      // operador de 0 a 3 na ordem OP1-OP4 (ou -1: todos), como no OPN
+      static const int regOrder[4]={0,2,1,3};
+      for (int k=0; k<4; k++) {
+        if (c.value>=0 && c.value<4 && k!=regOrder[c.value]) continue;
+        if (c.value>=4) break;
+        DivInstrumentFM::Operator& op=chan[c.chan].state.op[k];
+        switch (c.cmd) {
+          case DIV_CMD_FM_TL: op.tl=c.value2&127; break;
+          case DIV_CMD_FM_MULT: op.mult=c.value2&15; break;
+          case DIV_CMD_FM_AR: op.ar=c.value2&31; break;
+          case DIV_CMD_FM_DR: op.dr=c.value2&31; break;
+          case DIV_CMD_FM_D2R: op.d2r=c.value2&31; break;
+          case DIV_CMD_FM_SL: op.sl=c.value2&15; break;
+          case DIV_CMD_FM_RR: op.rr=c.value2&15; break;
+          case DIV_CMD_FM_DT: op.dt=c.value2&7; break;
+          case DIV_CMD_FM_RS: op.rs=c.value2&3; break;
+          case DIV_CMD_FM_AM: op.am=c.value2&1; break;
+          case DIV_CMD_FM_SSG: op.ssgEnv=c.value2&15; break;
+          default: break;
+        }
+      }
+      commitOps(c.chan);
+      break;
+    }
     case DIV_CMD_PITCH:
       chan[c.chan].pitch=c.value;
       chan[c.chan].freqChanged=true;
@@ -501,9 +601,7 @@ void DivPlatformBR1611::forceIns() {
   for (int i=0; i<7; i++) {
     chan[i].insChanged=true;
     chan[i].freqChanged=true;
-    for (int j=0; j<4; j++) {
-      if (chan[i].waves[j]>=0) uploadWave(i,j,chan[i].waves[j]);
-    }
+    uploadWaves(i);
     commitOps(i);
     commitChannel(i);
   }
@@ -513,17 +611,14 @@ void DivPlatformBR1611::notifyInsChange(int ins) {
   for (int i=0; i<7; i++) {
     if (chan[i].ins==ins) {
       chan[i].insChanged=true;
+      // (ondas editadas mudam na hora, mesmo com a nota tocando)
+      uploadWaves(i);
     }
   }
 }
 
 void DivPlatformBR1611::notifyWaveChange(int wave) {
-  for (int i=0; i<7; i++) {
-    if (chan[i].pcm) continue;
-    for (int j=0; j<4; j++) {
-      if (chan[i].waves[j]==wave) uploadWave(i,j,wave);
-    }
-  }
+  // (as ondas dos operadores ficam nos instrumentos, nao na lista de wavetables)
 }
 
 SharedChannel* DivPlatformBR1611::getChanState(int ch) {

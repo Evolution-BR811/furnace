@@ -27,6 +27,10 @@
 #define RATE_DIVIDER 57
 #define BR811_CLOCK 6420000
 
+// BR411 (Ompreza P): clock 5 MHz (o da CPU RS04L) e prescaler de afinacao /64
+#define BR411_DIVIDER 64
+#define BR411_CLOCK 5000000
+
 const char* regCheatSheetBR811[]={
   "CH1_Control", "00",
   "CH1_PeriodLow", "01",
@@ -50,8 +54,24 @@ const char* regCheatSheetBR811[]={
   NULL
 };
 
+const char* regCheatSheetBR411[]={
+  "CH1_Control", "00",
+  "CH1_PeriodLow", "01",
+  "CH1_PeriodHigh_Noise", "02",
+  "CH2_Control", "03",
+  "CH2_PeriodLow", "04",
+  "CH2_PeriodHigh_Noise", "05",
+  "CH3_Control", "06",
+  "CH3_PeriodLow", "07",
+  "CH3_PeriodHigh_Noise", "08",
+  "CH4_Control", "09",
+  "CH4_PeriodLow", "0A",
+  "CH4_PeriodHigh_Noise", "0B",
+  NULL
+};
+
 const char** DivPlatformBR811::getRegisterSheet() {
-  return regCheatSheetBR811;
+  return br411?regCheatSheetBR411:regCheatSheetBR811;
 }
 
 // escreve um registrador do chip e guarda uma copia no regPool
@@ -113,7 +133,7 @@ void DivPlatformBR811::commit(int ch) {
 }
 
 void DivPlatformBR811::acquire(short** buf, size_t len) {
-  for (int i=0; i<5; i++) {
+  for (int i=0; i<chans; i++) {
     oscBuf[i]->begin(len);
   }
 
@@ -129,24 +149,27 @@ void DivPlatformBR811::acquire(short** buf, size_t len) {
     chip.render(mix,(int)n,chPtr);
     for (size_t k=0; k<n; k++) {
       buf[0][done+k]=(short)(mix[k]*32767.0f);
-      for (int i=0; i<5; i++) {
+      for (int i=0; i<chans; i++) {
         oscBuf[i]->putSample(done+k,(short)(chOut[i][k]*16384.0f));
       }
     }
     done+=n;
   }
 
-  for (int i=0; i<5; i++) {
+  for (int i=0; i<chans; i++) {
     oscBuf[i]->end(len);
   }
 }
 
 void DivPlatformBR811::tick(bool sysTick) {
-  for (int i=0; i<5; i++) {
+  for (int i=0; i<chans; i++) {
     chan[i].std.next();
     if (chan[i].std.vol.had) {
-      int volRange=(i==4)?pcmMaxVol():15;
-      chan[i].outVol=VOL_SCALE_LINEAR(chan[i].vol&31,MIN(volRange,chan[i].std.vol.val),volRange);
+      // ondas e ruido: volume 0-15 (como NES e Master System); so o PCM do
+      // canal 5 com o chip de cartucho PCM Volume Plus vai de 0 a 30
+      int volRange=(i==4 && chan[i].pcm)?pcmMaxVol():15;
+      int baseVol=MIN(chan[i].vol&31,volRange);
+      chan[i].outVol=VOL_SCALE_LINEAR(baseVol,MIN(volRange,chan[i].std.vol.val),volRange);
       chan[i].dirty=true;
     }
     if (NEW_ARP_STRAT) {
@@ -158,7 +181,8 @@ void DivPlatformBR811::tick(bool sysTick) {
       chan[i].freqChanged=true;
     }
     if (chan[i].std.duty.had) {
-      chan[i].source=chan[i].std.duty.val&7;
+      // instrumento BR411: macro Waveform 0-6 (sem a Onda B)
+      chan[i].source=chan[i].br411Ins?br411Source(chan[i].std.duty.val):(chan[i].std.duty.val&7);
       chan[i].dirty=true;
     }
     if (chan[i].std.pitch.had) {
@@ -197,7 +221,10 @@ void DivPlatformBR811::tick(bool sysTick) {
 int DivPlatformBR811::dispatch(DivCommand c) {
   switch (c.cmd) {
     case DIV_CMD_NOTE_ON: {
-      DivInstrument* ins=parent->getIns(chan[c.chan].ins,DIV_INS_BR811);
+      DivInstrument* ins=parent->getIns(chan[c.chan].ins,br411?DIV_INS_BR411:DIV_INS_BR811);
+      // instrumentos do tipo BR411 usam a numeracao de fontes sem a Onda B.
+      // (instrumentos BR811 antigos continuam tocando no BR411 como antes)
+      chan[c.chan].br411Ins=(ins->type==DIV_INS_BR411);
       // canal 5: instrumento BR811 com "Use sample" ligado = PCM
       chan[c.chan].pcm=(c.chan==4 && (ins->type==DIV_INS_AMIGA || ins->amiga.useSample));
       if (chan[c.chan].pcm && c.value!=DIV_NOTE_NULL) {
@@ -249,8 +276,13 @@ int DivPlatformBR811::dispatch(DivCommand c) {
       chan[c.chan].pitch=c.value;
       chan[c.chan].freqChanged=true;
       break;
-    case DIV_CMD_STD_NOISE_MODE: // efeito 20xx: escolhe a fonte do som (0-7)
-      if (c.value>=0 && c.value<8) {
+    case DIV_CMD_STD_NOISE_MODE: // efeito 20xx: escolhe a fonte do som (BR811: 0-7, BR411: 0-6)
+      if (br411) {
+        if (c.value>=0 && c.value<7) {
+          chan[c.chan].source=br411Source(c.value);
+          chan[c.chan].dirty=true;
+        }
+      } else if (c.value>=0 && c.value<8) {
         chan[c.chan].source=c.value;
         chan[c.chan].dirty=true;
       }
@@ -285,7 +317,7 @@ int DivPlatformBR811::dispatch(DivCommand c) {
       break;
     case DIV_CMD_PRE_PORTA:
       if (chan[c.chan].active && c.value2) {
-        if (parent->song.compatFlags.resetMacroOnPorta) chan[c.chan].macroInit(parent->getIns(chan[c.chan].ins,DIV_INS_BR811));
+        if (parent->song.compatFlags.resetMacroOnPorta) chan[c.chan].macroInit(parent->getIns(chan[c.chan].ins,br411?DIV_INS_BR411:DIV_INS_BR811));
       }
       if (!chan[c.chan].inPorta && c.value && !parent->song.compatFlags.brokenPortaArp && chan[c.chan].std.arp.will && !NEW_ARP_STRAT) chan[c.chan].baseFreq=chan[c.chan].calcBaseFreq(chan[c.chan].note);
       chan[c.chan].inPorta=c.value;
@@ -318,7 +350,7 @@ bool DivPlatformBR811::keyOffAffectsArp(int ch) {
 }
 
 void DivPlatformBR811::forceIns() {
-  for (int i=0; i<5; i++) {
+  for (int i=0; i<chans; i++) {
     chan[i].insChanged=true;
     chan[i].freqChanged=true;
     chan[i].dirty=true;
@@ -342,14 +374,14 @@ unsigned char* DivPlatformBR811::getRegisterPool() {
 }
 
 int DivPlatformBR811::getRegisterPoolSize() {
-  return 19;
+  return br411?12:19;
 }
 
 void DivPlatformBR811::reset() {
   memset(regPool,0,19);
   chip.reset();
   pcmActive=false;
-  for (int i=0; i<5; i++) {
+  for (int i=0; i<chans; i++) {
     // o canal 5 (PCM) tem volume maximo 30; os demais, 15
     chan[i]=Channel(parent->song.compatFlags.linearPitch,(i==4)?pcmMaxVol():15);
     chan[i].pitchTable=&pitchTable;
@@ -367,13 +399,13 @@ bool DivPlatformBR811::getDCOffRequired() {
 }
 
 void DivPlatformBR811::notifyInsDeletion(void* ins) {
-  for (int i=0; i<5; i++) {
+  for (int i=0; i<chans; i++) {
     chan[i].std.notifyInsDeletion((DivInstrument*)ins);
   }
 }
 
 void DivPlatformBR811::notifyPitchTable(int sample) {
-  pitchTable.init(parent->song.tuning,chipClock,CHIP_DIVIDER,4096,true,parent->song.compatFlags.linearPitch);
+  pitchTable.init(parent->song.tuning,chipClock,br411?BR411_DIVIDER:CHIP_DIVIDER,4096,true,parent->song.compatFlags.linearPitch);
 }
 
 unsigned int DivPlatformBR811::getMaxFreq(int ch) {
@@ -381,13 +413,23 @@ unsigned int DivPlatformBR811::getMaxFreq(int ch) {
 }
 
 void DivPlatformBR811::setFlags(const DivConfig& flags) {
-  // o clock do BR811 e fixo: o mesmo da CPU RS04 do Ompreza (6,42 MHz)
-  chipClock=BR811_CLOCK;
-  pcmVolumePlus=flags.getBool("pcmVolumePlus",false);
+  if (br411) {
+    // o clock do BR411 e fixo: o mesmo da CPU RS04L do Ompreza P (5 MHz)
+    chipClock=BR411_CLOCK;
+    pcmVolumePlus=false; // o BR411 nao tem PCM
+    rate=chipClock/BR411_DIVIDER;
+  } else {
+    // o clock do BR811 e fixo: o mesmo da CPU RS04 do Ompreza (6,42 MHz)
+    chipClock=BR811_CLOCK;
+    pcmVolumePlus=flags.getBool("pcmVolumePlus",false);
+    rate=chipClock/RATE_DIVIDER;
+  }
+  // "BR811 corrigido" (so no BR811)
+  squareWaveA=!br411 && flags.getBool("squareWaveA",false);
+  chip.setSquareWaveA(squareWaveA);
   chip.setPcmVolumePlus(pcmVolumePlus);
-  rate=chipClock/RATE_DIVIDER;
   chip.setSampleRate(rate);
-  for (int i=0; i<5; i++) {
+  for (int i=0; i<chans; i++) {
     oscBuf[i]->setRate(rate);
   }
 
@@ -395,7 +437,7 @@ void DivPlatformBR811::setFlags(const DivConfig& flags) {
 }
 
 void DivPlatformBR811::poke(unsigned int addr, unsigned short val) {
-  if (addr>=19) return;
+  if (addr>=(unsigned int)getRegisterPoolSize()) return;
   if (addr>=15) {
     chipWritePcm(addr-15,val);
     return;
@@ -421,9 +463,16 @@ int DivPlatformBR811::init(DivEngine* p, int channels, int sugRate, const DivCon
   pcmActive=false;
   // o chip le os samples da "ROM do cartucho"
   chip.setRomReader([this](uint16_t addr) -> uint8_t { return sampleMem[addr]; });
+  // o chip certo (BR811 ou BR411) antes de configurar a taxa
+  chip.setVariant(br411?br811::VARIANT_BR411:br811::VARIANT_BR811);
   setFlags(flags);
   reset();
-  return 5;
+  return chans;
+}
+
+void DivPlatformBR811::setBR411(bool enable) {
+  br411=enable;
+  chans=enable?4:5;
 }
 
 void DivPlatformBR811::quit() {
@@ -437,7 +486,8 @@ const void* DivPlatformBR811::getSampleMem(int index) {
 }
 
 size_t DivPlatformBR811::getSampleMemCapacity(int index) {
-  return index==0?65536:0;
+  // o BR411 nao tem PCM, entao nao tem memoria de samples
+  return (index==0 && !br411)?65536:0;
 }
 
 size_t DivPlatformBR811::getSampleMemUsage(int index) {
@@ -445,13 +495,13 @@ size_t DivPlatformBR811::getSampleMemUsage(int index) {
 }
 
 bool DivPlatformBR811::isSampleLoaded(int index, int sample) {
-  if (index!=0) return false;
+  if (index!=0 || br411) return false;
   if (sample<0 || sample>=getMaxSamples(index)) return false;
   return sampleLoaded[sample];
 }
 
 const DivMemoryComposition* DivPlatformBR811::getMemCompo(int index) {
-  if (index!=0) return NULL;
+  if (index!=0 || br411) return NULL;
   return &memCompo;
 }
 
@@ -462,6 +512,11 @@ void DivPlatformBR811::renderSamples(int sysID) {
 
   memCompo=DivMemoryComposition();
   memCompo.name="Sample ROM";
+  if (br411) {
+    // o BR411 nao tem PCM: nenhum sample vai para a ROM
+    sampleMemLen=0;
+    return;
+  }
 
   size_t memPos=0;
   for (int i=0; i<parent->song.sampleLen; i++) {
@@ -497,7 +552,10 @@ void DivPlatformBR811::renderSamples(int sysID) {
   memCompo.used=sampleMemLen;
 }
 
-DivPlatformBR811::DivPlatformBR811() {
+DivPlatformBR811::DivPlatformBR811():
+  br411(false),
+  squareWaveA(false),
+  chans(5) {
   sampleMem=new unsigned char[65536];
   sampleOff=new unsigned int[32768];
   sampleLenBytes=new unsigned int[32768];

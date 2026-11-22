@@ -1126,6 +1126,7 @@ void DivGroovePattern::putData(SafeWriter* w) {
 void DivCompatFlags::setDefaults() {
   limitSlides=false;
   linearPitch=1;
+  partialPitch=false;
   pitchSlideSpeed=4;
   loopModality=2;
   delayBehavior=2;
@@ -1213,6 +1214,7 @@ bool DivCompatFlags::readData(SafeReader& reader) {
 
   CHECK_AND_LOAD_BOOL(limitSlides);
   CHECK_AND_LOAD_UNSIGNED_CHAR(linearPitch);
+  CHECK_AND_LOAD_BOOL(partialPitch);
   CHECK_AND_LOAD_UNSIGNED_CHAR(pitchSlideSpeed);
   CHECK_AND_LOAD_UNSIGNED_CHAR(loopModality);
   CHECK_AND_LOAD_UNSIGNED_CHAR(delayBehavior);
@@ -1289,6 +1291,7 @@ void DivCompatFlags::putData(SafeWriter* w) {
 
   CHECK_AND_STORE_BOOL(limitSlides);
   CHECK_AND_STORE_UNSIGNED_CHAR(linearPitch);
+  CHECK_AND_STORE_BOOL(partialPitch);
   CHECK_AND_STORE_UNSIGNED_CHAR(pitchSlideSpeed);
   CHECK_AND_STORE_UNSIGNED_CHAR(loopModality);
   CHECK_AND_STORE_UNSIGNED_CHAR(delayBehavior);

@@ -173,7 +173,9 @@ bool DivEngine::loadDMF(unsigned char* file, size_t len) {
     // compatibility flags
     if (!getConfInt("noDMFCompat",0)) {
       ds.compatFlags.limitSlides=true;
-      ds.compatFlags.linearPitch=1;
+      // DefleMask usa linearidade parcial
+      ds.compatFlags.linearPitch=0;
+      ds.compatFlags.partialPitch=true;
       ds.compatFlags.loopModality=0;
       ds.compatFlags.properNoiseLayout=false;
       ds.compatFlags.waveDutyIsVol=false;

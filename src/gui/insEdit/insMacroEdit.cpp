@@ -764,6 +764,71 @@ void FurnaceGUI::drawMacroEdit(FurnaceGUIMacroDesc& i, int totalFit, float avail
   } \
   popToggleColors(); \
 
+// sobe ou desce uma oitava em todos os passos da macro de arpejo (ajuda na conversao entre chips)
+// notas relativas ficam dentro de min..max; notas fixas (bit 30) mudam de oitava sem perder o modo fixo
+static bool arpMacroIsFixed(int v) {
+  return (v<0)?(!(v&0x40000000)):(v&0x40000000);
+}
+static bool shiftArpMacroOctave(DivInstrumentMacro* m, int semitones, int minVal, int maxVal) {
+  // confere antes se tudo cabe, para nao deixar a macro pela metade
+  for (int j=0; j<m->len; j++) {
+    int v=m->val[j];
+    if (arpMacroIsFixed(v)) {
+      if (!arpMacroIsFixed(v+semitones)) return false;
+    } else {
+      if (v+semitones<minVal || v+semitones>maxVal) return false;
+    }
+  }
+  for (int j=0; j<m->len; j++) m->val[j]+=semitones;
+  return true;
+}
+
+#define BUTTONS_FOR_ARP_OCTAVE(buttonType) \
+  if ((i.macro->macroType==DIV_MACRO_ARP || i.isArp) && (i.macro->open&6)==0) { \
+    /* linha propria: na coluna estreita do editor os dois botoes cabem lado a lado */ \
+    if (buttonType(ICON_FA_ARROW_UP "##IMacroArpOctUp")) { \
+      if (shiftArpMacroOctave(i.macro,12,i.min,i.max)) { MARK_MODIFIED; } \
+    } \
+    if (ImGui::IsItemHovered()) { \
+      ImGui::SetTooltip(_("Arpeggio: one octave up (+12 semitones on every step)")); \
+    } \
+    ImGui::SameLine(); \
+    if (buttonType(ICON_FA_ARROW_DOWN "##IMacroArpOctDown")) { \
+      if (shiftArpMacroOctave(i.macro,-12,i.min,i.max)) { MARK_MODIFIED; } \
+    } \
+    if (ImGui::IsItemHovered()) { \
+      ImGui::SetTooltip(_("Arpeggio: one octave down (-12 semitones on every step)")); \
+    } \
+  }
+
+// sobe ou desce 1 valor (no arpejo, 1 semitom) em todos os passos de qualquer macro
+// (menos as de bits): so muda se todos os valores continuarem dentro de min..max
+static bool shiftMacroValues(DivInstrumentMacro* m, int delta, int minVal, int maxVal) {
+  for (int j=0; j<m->len; j++) {
+    if (m->val[j]+delta<minVal || m->val[j]+delta>maxVal) return false;
+  }
+  for (int j=0; j<m->len; j++) m->val[j]+=delta;
+  return true;
+}
+
+#define BUTTONS_FOR_MACRO_STEP(buttonType) \
+  if (!i.isBitfield && (i.macro->open&6)==0) { \
+    bool stepIsArp=(i.macro->macroType==DIV_MACRO_ARP || i.isArp); \
+    if (buttonType(ICON_FA_PLUS "##IMacroStepUp")) { \
+      if (stepIsArp?shiftArpMacroOctave(i.macro,1,i.min,i.max):shiftMacroValues(i.macro,1,i.min,i.max)) { MARK_MODIFIED; } \
+    } \
+    if (ImGui::IsItemHovered()) { \
+      ImGui::SetTooltip(stepIsArp?_("Arpeggio: one semitone up (+1 on every step)"):_("Macro: +1 on every step")); \
+    } \
+    ImGui::SameLine(); \
+    if (buttonType(ICON_FA_MINUS "##IMacroStepDown")) { \
+      if (stepIsArp?shiftArpMacroOctave(i.macro,-1,i.min,i.max):shiftMacroValues(i.macro,-1,i.min,i.max)) { MARK_MODIFIED; } \
+    } \
+    if (ImGui::IsItemHovered()) { \
+      ImGui::SetTooltip(stepIsArp?_("Arpeggio: one semitone down (-1 on every step)"):_("Macro: -1 on every step")); \
+    } \
+  }
+
 #define BUTTON_FOR_MACRO_MENU(buttonType) \
   if (mobileUI) { \
     if (buttonType(ICON_FA_PAGELINES "##IMacroMenu")) { \
@@ -861,6 +926,8 @@ void FurnaceGUI::drawMacros(std::vector<FurnaceGUIMacroDesc>& macros, FurnaceGUI
               ImGui::SameLine();
               BUTTON_TO_SET_RELEASE(ImGui::Button);
             }
+            BUTTONS_FOR_ARP_OCTAVE(ImGui::Button);
+            BUTTONS_FOR_MACRO_STEP(ImGui::Button);
             BUTTON_FOR_MACRO_MENU(ImGui::Button);
             // do not change this!
             // anything other than a checkbox will look ugly!
@@ -952,6 +1019,8 @@ void FurnaceGUI::drawMacros(std::vector<FurnaceGUIMacroDesc>& macros, FurnaceGUI
               ImGui::SameLine();
               BUTTON_TO_SET_RELEASE(ImGui::Button);
             }
+            BUTTONS_FOR_ARP_OCTAVE(ImGui::Button);
+            BUTTONS_FOR_MACRO_STEP(ImGui::Button);
             BUTTON_FOR_MACRO_MENU(ImGui::Button);
             if (i.modeName!=NULL) {
               bool modeVal=i.macro->mode;
@@ -1110,6 +1179,8 @@ void FurnaceGUI::drawMacros(std::vector<FurnaceGUIMacroDesc>& macros, FurnaceGUI
                   ImGui::SameLine();
                   BUTTON_TO_SET_RELEASE(ImGui::Button);
                 }
+                BUTTONS_FOR_ARP_OCTAVE(ImGui::Button);
+                BUTTONS_FOR_MACRO_STEP(ImGui::Button);
                 BUTTON_FOR_MACRO_MENU(ImGui::Button);
               }
               if (m.modeName!=NULL) {

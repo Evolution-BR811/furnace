@@ -82,6 +82,7 @@
 #include "platform/pv1000.h"
 #include "platform/br811.h"
 #include "platform/br1611.h"
+#include "platform/pwm32x.h"
 #include "platform/k053260.h"
 #include "platform/ted.h"
 #include "platform/c140.h"
@@ -740,8 +741,16 @@ void DivDispatchContainer::init(DivSystem sys, DivEngine* eng, int chanCount, do
     case DIV_SYSTEM_BR811:
       dispatch=new DivPlatformBR811;
       break;
+    case DIV_SYSTEM_BR411:
+      // o BR411 e uma variante do BR811: mesma classe, modo BR411
+      dispatch=new DivPlatformBR811;
+      ((DivPlatformBR811*)dispatch)->setBR411(true);
+      break;
     case DIV_SYSTEM_BR1611:
       dispatch=new DivPlatformBR1611;
+      break;
+    case DIV_SYSTEM_PWM_32X:
+      dispatch=new DivPlatformPWM32X;
       break;
     case DIV_SYSTEM_PCM_DAC:
       dispatch=new DivPlatformPCMDAC;

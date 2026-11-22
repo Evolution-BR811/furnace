@@ -797,6 +797,7 @@ src/engine/fileOps/mod.cpp
 src/engine/fileOps/s3m.cpp
 src/engine/fileOps/text.cpp
 src/engine/fileOps/tfm.cpp
+src/engine/fileOps/vgm.cpp
 src/engine/fileOps/xm.cpp
 
 src/engine/fileOps/p.cpp
@@ -830,6 +831,7 @@ src/engine/legacySample.cpp
 src/engine/macroInt.cpp
 src/engine/pattern.cpp
 src/engine/pitchTable.cpp
+src/engine/volumeAdapt.cpp
 src/engine/playback.cpp
 src/engine/sample.cpp
 src/engine/song.cpp
@@ -904,6 +906,7 @@ src/engine/platform/scvtone.cpp
 src/engine/platform/pv1000.cpp
 src/engine/platform/br811.cpp
 src/engine/platform/br1611.cpp
+src/engine/platform/pwm32x.cpp
 src/engine/platform/sound/br811.cpp
 src/engine/platform/sound/br1611.cpp
 src/engine/platform/k053260.cpp

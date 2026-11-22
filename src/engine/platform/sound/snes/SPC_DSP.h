@@ -70,6 +70,11 @@ public:
 
 	// Furnace addition, gets all current voice outputs to an array of samples
 	void get_voice_outputs( sample_t* outs );
+
+	// Furnace addition: the largest value the sums inside reached (the voices'
+	// total, the echo's input and its filter), before they are clipped to 16
+	// bits. the SPC importer uses it to see how much room there is
+	int peak_sum = 0;
 	
 // DSP register addresses
 

@@ -104,6 +104,7 @@ enum DivInstrumentType: unsigned short {
   DIV_INS_KLATTSCH=67,
   DIV_INS_BR811=68,
   DIV_INS_BR1611=69,
+  DIV_INS_BR411=70,
   DIV_INS_MAX,
   DIV_INS_NULL
 };
@@ -919,11 +920,17 @@ struct DivInstrumentPowerNoise {
     octave(0) {}
 };
 
-// BR1611 (Ompreza 2): a onda (wavetable da musica) de cada um dos 4 operadores da WMS
-// e o envelope proprio do PCM (canais 6 e 7), separado do envelope dos operadores
+// BR1611 (Ompreza 2): a onda de cada um dos 4 operadores da WMS, guardada no
+// proprio instrumento (ate 256 pontos de 0 a 255, centro em 128; o chip a
+// reamostra para 256), e o envelope proprio do PCM (canais 6 e 7), separado
+// do envelope dos operadores. operadores na ordem de DivInstrumentFM::op.
 struct DivInstrumentBR1611 {
-  unsigned char wave[4];
+  unsigned short waveLen[4];
+  unsigned char waveData[4][256];
   unsigned char pcmAR, pcmD1R, pcmSL, pcmD2R, pcmRR, pcmTL;
+
+  // onda padrao: senoide de 256 pontos
+  void setSine(int op);
 
   bool operator==(const DivInstrumentBR1611& other);
   bool operator!=(const DivInstrumentBR1611& other) {
@@ -936,10 +943,7 @@ struct DivInstrumentBR1611 {
     pcmD2R(0),
     pcmRR(15),
     pcmTL(0) {
-    wave[0]=0;
-    wave[1]=0;
-    wave[2]=0;
-    wave[3]=0;
+    for (int i=0; i<4; i++) setSine(i);
   }
 };
 

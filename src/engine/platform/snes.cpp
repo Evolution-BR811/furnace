@@ -875,8 +875,8 @@ void DivPlatformSNES::reset() {
   // I hope 0x400 is good enough...
   sampleTableBase=0x400;
   rWrite(0x5d,sampleTableBase>>8);
-  rWrite(0x0c,127); // global volume left
-  rWrite(0x1c,127); // global volume right
+  rWrite(0x0c,initDryVolL); // global volume left
+  rWrite(0x1c,initDryVolR); // global volume right
   rWrite(0x6c,0); // get DSP out of reset
   for (int i=0; i<8; i++) {
     chan[i]=Channel();
@@ -893,8 +893,8 @@ void DivPlatformSNES::reset() {
   writeEcho=true;
   writeDryVol=false;
 
-  dryVolL=127;
-  dryVolR=127;
+  dryVolL=initDryVolL;
+  dryVolR=initDryVolR;
 
   echoDelay=initEchoDelay;
   echoFeedback=initEchoFeedback;
@@ -1112,6 +1112,10 @@ void DivPlatformSNES::setFlags(const DivConfig& flags) {
   initEchoOn=flags.getBool("echo",false);
   initEchoVolL=flags.getInt("echoVolL",127);
   initEchoVolR=flags.getInt("echoVolR",127);
+  // (the main volume register: signed, like the echo volume. a negative
+  // one inverts that side, as on the real chip)
+  initDryVolL=flags.getInt("dryVolL",127);
+  initDryVolR=flags.getInt("dryVolR",127);
   initEchoDelay=flags.getInt("echoDelay",0)&15;
   initEchoFeedback=flags.getInt("echoFeedback",0);
 

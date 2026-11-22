@@ -1,0 +1,190 @@
+From 9577dc043d01fdba1223d22946d5100f46a7ac8c Mon Sep 17 00:00:00 2001
+From: Evolution BR811 <344454957+Evolution-BR811@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 18:34:23 -0400
+Subject: [PATCH] VGM/NSF import: period pitch mode for 2A03 songs that need it
+
+Game drivers slide and tune in periods. With Furnace's non-linear pitch
+the fine tune (E5xx), pitch macro and vibrato count in periods too, so a
+slide of so many periods per tick is one macro on any note and a driver's
+own tuning is just E5xx. The notes are built both ways; songs with only
+the 2A03 use periods when every note still comes out exact and it saves
+at least 10% of the instruments, or the song doesn't fit in 256 otherwise
+(e.g. Silver Surfer: 253 instruments, none approximated, instead of 256
+with 61 notes on the closest instrument).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KMJUrc1fn7dir5w2PfSPK2
+---
+ src/engine/fileOps/vgm.cpp | 91 +++++++++++++++++++++++++++++++++++---
+ 1 file changed, 85 insertions(+), 6 deletions(-)
+
+diff --git a/src/engine/fileOps/vgm.cpp b/src/engine/fileOps/vgm.cpp
+index 1b0562a..8686c88 100644
+--- a/src/engine/fileOps/vgm.cpp
++++ b/src/engine/fileOps/vgm.cpp
+@@ -685,6 +685,9 @@ struct VGMNESContext {
+   int shareLimit=0;
+   // the channels each instrument plays on (for its name)
+   std::map<int,std::vector<String>> insChans;
++  // pitch mode of the song (-1: not decided yet, 0: linear, 1: periods).
++  // the first subsong decides, the others follow (it is one song setting)
++  int pitchMode=-1;
+ };
+ 
+ // turns an APU log into notes, instruments and effects in one subsong
+@@ -1380,6 +1383,30 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     auto tickNote=[&](int c, const VGMChanTick& t) -> int {
+       return (tickOffset(c,t)+64)>>7;
+     };
++    // period mode (Furnace's non-linear pitch): the fine tune, pitch macro and
++    // vibrato count in periods, like the game's driver does. a slide of so
++    // many periods per tick is then the same macro on any note, and a
++    // driver's own tuning is just an E5xx. only for songs with only the
++    // 2A03 (the pitch mode is one setting for the whole song); the pulses
++    // and the triangle use it, the noise keeps its notes.
++    const bool canPeriod=log.hasNES && !log.has5B && !log.hasSN && !log.hasOPLL;
++    DivPitchTable ptPer;
++    if (canPeriod) ptPer.init(ds.tuning,log.clock,16,0x800,true,false);
++    bool curPeriod=false;
++    auto usesPer=[&](int c) -> bool {
++      return curPeriod && c<3;
++    };
++    // the period Furnace writes for note n with pitch r (r: 1/128 semitone,
++    // or periods in period mode)
++    auto periodOf=[&](int c, int n, int r) -> int {
++      if (usesPer(c)) {
++        int p=ptPer.getBase(n)-r-1;
++        if (p<0) p=0;
++        if (p>2047) p=2047;
++        return p;
++      }
++      return periodAt(c,(n<<7)+r);
++    };
+ 
+     // --- step 6: note onsets (first pass) ---
+     std::vector<int> onsets[NCH];
+@@ -2103,10 +2130,16 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     int scaledAlt=0, prefixAlt=0, passAlt=-1;
+     bool anyRepeat=false;
+     for (int c: tonal) if (onsetsRep[c]!=onsets[c]) anyRepeat=true;
+-    for (int pass=0; pass<4; pass++) {
++    int periodInexact=0;
++    for (int pass=0; pass<8; pass++) {
+       const bool allowADSR=!(pass&1);
+       const bool useRep=(pass&2);
+-      if (useRep && !anyRepeat) break;
++      curPeriod=(pass&4);
++      if (useRep && !anyRepeat) continue;
++      if (curPeriod && !canPeriod) continue;
++      // (a later subsong follows the pitch mode of the first)
++      if (ctx.pitchMode>=0 && curPeriod!=(ctx.pitchMode==1)) continue;
++      periodInexact=0;
+       sets.clear();
+       setMap.clear();
+       recs.clear();
+@@ -2387,6 +2420,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           std::vector<int> vVol, vDuty, vArp, vPitch, vNoise, vEnv;
+           // (on the SN76489, vNoise holds the Game Gear panning)
+           int lastOff=tickOffset(c,ct[a]);
++          int lastPer=ct[a].period;
+           int lastDuty=ct[a].duty;
+           int lastNoise=31-ct[a].noise;
+           bool usesNoise=false, usesEnv=false;
+@@ -2394,14 +2428,26 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           for (int k=a; k<macroEnd; k++) {
+             const VGMChanTick& t=ct[k];
+             int off=t.aud?tickOffset(c,t):lastOff;
++            int per=t.aud?t.period:lastPer;
+             int duty=t.aud?t.duty:lastDuty;
+             lastOff=off;
++            lastPer=per;
+             lastDuty=duty;
+             int n=(off+64)>>7;
+             vVol.push_back(t.vol);
+             vDuty.push_back(duty);
+             vArp.push_back(n-segBase[k-a]-arpAdd[k-a]);
+-            vPitch.push_back(off-(n<<7));
++            if (usesPer(c)) {
++              // (a period at the limit of the register is reached by any pitch
++              // past it: take the one closest to none)
++              int bse=ptPer.getBase(std::max(0,std::min(179,n)));
++              int r=bse-(per+1);
++              if (per>=2047 && bse-1>=2047) r=0;
++              if (per<=0 && bse-1<=0) r=0;
++              vPitch.push_back(r);
++            } else {
++              vPitch.push_back(off-(n<<7));
++            }
+             if (isSN && log.snStereo) {
+               vNoise.push_back(t.noise);
+               usesNoise=true;
+@@ -2476,7 +2522,21 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+               if (vPitch[j]==0 || !ct[a+j].aud) continue;
+               int n=vArp[j]+segBase[j]+arpAdd[j];
+               int f=(segIdx[j]==0)?fine:legato[segIdx[j]-1][3];
+-              if (periodAt(c,(n<<7)+f)==ct[a+j].period) vPitch[j]=0;
++              if (periodOf(c,n,f)==ct[a+j].period) vPitch[j]=0;
++            }
++          }
++          // period mode: every tick must come out exactly (very low notes or
++          // big fine tunes may not fit; the song then stays linear)
++          if (curPeriod && c<3) {
++            for (size_t j=0; j<vPitch.size(); j++) {
++              if (!ct[a+j].aud) continue;
++              int n=vArp[j]+segBase[j]+arpAdd[j];
++              int f=(segIdx[j]==0)?fine:legato[segIdx[j]-1][3];
++              bool bad=(n<0 || n>179 || f<-127 || f>127 || periodOf(c,n,f+vPitch[j])!=ct[a+j].period);
++              if (bad) {
++                periodInexact++;
++                break;
++              }
+             }
+           }
+           // a vibrato that Furnace's own 04xy makes exactly (songs made in
+@@ -2523,7 +2583,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+                         int pos=((j-kv+1)*rate)&63;
+                         vib=((depth*vibT[pos]*15)>>4)/15;
+                       }
+-                      if (periodAt(c,((base+arpAdd[j])<<7)+fines[fi]+vib)!=ct[a+j].period) ok=false;
++                      if (periodOf(c,base+arpAdd[j],fines[fi]+vib)!=ct[a+j].period) ok=false;
+                     }
+                     if (ok) {
+                       found=true;
+@@ -2849,7 +2909,18 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       }
+ 
+ 
+-      // keep the best so far in setsAlt
++      // keep the best so far in setsAlt (period mode only if every note
++      // comes out exact with it)
++      if (curPeriod && periodInexact>0) {
++        logI("VGM import: periods for the pitch would change %d notes, staying linear",periodInexact);
++        continue;
++      }
++      // (and only if it saves a lot: at least 10% of the instruments, or
++      // the song doesn't fit in 256 instruments otherwise)
++      if (curPeriod && passAlt>=0 && !(passAlt&4)) {
++        bool overLimit=(setsAlt.size()+ds.ins.size()>256);
++        if (!overLimit && sets.size()*10>setsAlt.size()*9) continue;
++      }
+       if (passAlt<0 || sets.size()<setsAlt.size()) {
+         setsAlt.swap(sets);
+         recsAlt.swap(recs);
+@@ -2867,6 +2938,14 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       logI("VGM import: using repeated notes");
+       for (int c: tonal) onsets[c]=onsetsRep[c];
+     }
++    curPeriod=(passAlt&4);
++    if (ctx.pitchMode<0) {
++      ctx.pitchMode=curPeriod?1:0;
++      if (curPeriod) {
++        ds.compatFlags.linearPitch=false;
++        logI("VGM import: using periods for the pitch (non-linear pitch): fewer instruments");
++      }
++    }
+ 
+     // --- the whole song at once: an instrument that is only a cut short or
+     // quieter version of another one goes away. (while the notes were being
+-- 
+2.43.0
+

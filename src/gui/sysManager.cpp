@@ -38,6 +38,10 @@ void FurnaceGUI::drawSysManager() {
   } else {
     //ImGui::SetNextWindowSizeConstraints(ImVec2(440.0f*dpiScale,400.0f*dpiScale),ImVec2(canvasW,canvasH));
   }
+  if (!sysAutoVolumeLoaded) {
+    sysAutoVolume=e->getConfBool("sysAutoVolume",true);
+    sysAutoVolumeLoaded=true;
+  }
   if (ImGui::Begin("Chip Manager",&sysManagerOpen,globalWinFlags,_("Chip Manager"))) {
     ImGuiStorage* openedConfig=ImGui::GetStateStorage();
     ImGui::Checkbox(_("Preserve channel order"),&preserveChanPos);
@@ -45,6 +49,59 @@ void FurnaceGUI::drawSysManager() {
     ImGui::Checkbox(_("Clone channel data"),&sysDupCloneChannels);
     ImGui::SameLine();
     ImGui::Checkbox(_("Clone at end"),&sysDupEnd);
+
+    // mixagem dos chips: volume de cada chip da musica.
+    // Usa o mesmo valor da janela Mixer (song.systemVol),
+    // entao fica salvo no .fur e os dois lugares mostram sempre o mesmo.
+    if (ImGui::CollapsingHeader(_("Chip mixing"),ImGuiTreeNodeFlags_DefaultOpen)) {
+      if (ImGui::BeginTable("ChipMixTable",3,ImGuiTableFlags_SizingStretchProp|ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn(_("Chip"),ImGuiTableColumnFlags_WidthStretch,0.4f);
+        ImGui::TableSetupColumn(_("Volume"),ImGuiTableColumnFlags_WidthStretch,0.6f);
+        ImGui::TableSetupColumn("##Reset",ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableHeadersRow();
+        for (int i=0; i<e->song.systemLen; i++) {
+          ImGui::PushID(i);
+          ImGui::TableNextRow();
+
+          ImGui::TableNextColumn();
+          ImGui::AlignTextToFramePadding();
+          ImGui::TextUnformatted(e->getSystemName(e->song.system[i]));
+
+          // volume em porcentagem (100% = padrao), sem perder a inversao de fase
+          ImGui::TableNextColumn();
+          float vol=fabs(e->song.systemVol[i]);
+          bool inverted=e->song.systemVol[i]<0;
+          float pct=vol*100.0f;
+          ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+          if (ImGui::SliderFloat("##MixVol",&pct,0.0f,200.0f,"%.0f%%")) {
+            if (pct<0.0f) pct=0.0f;
+            if (pct>1000.0f) pct=1000.0f;
+            vol=pct/100.0f;
+            if (inverted && vol<0.0001f) vol=0.0001f;
+            e->song.systemVol[i]=inverted?-vol:vol;
+            MARK_MODIFIED;
+          } rightClickable
+          if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            if (vol>0.0001f) {
+              ImGui::SetTooltip(_("Chip volume in the song mix: %+.1f dB (100%% = default).\nCtrl+click or right-click to type a value."),20.0f*log10f(vol));
+            } else {
+              ImGui::SetTooltip(_("Chip volume in the song mix: muted (100%% = default).\nCtrl+click or right-click to type a value."));
+            }
+          }
+
+          ImGui::TableNextColumn();
+          if (ImGui::Button(ICON_FA_UNDO "##MixReset")) {
+            e->song.systemVol[i]=inverted?-1.0f:1.0f;
+            MARK_MODIFIED;
+          }
+          if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(_("Reset to 100%%"));
+          }
+          ImGui::PopID();
+        }
+        ImGui::EndTable();
+      }
+    }
 
     // this is a "rack" style chip list
     int dispatchOff=0;
@@ -81,7 +138,7 @@ void FurnaceGUI::drawSysManager() {
         }
         ImGui::SameLine();
         float buttonInnerSize=ImGui::CalcTextSize(ICON_FA_CLONE).x;
-        float buttonCount=settings.rackShowLEDs?3.0f:4.0f;
+        float buttonCount=settings.rackShowLEDs?4.0f:5.0f;
         float sideButtonSize=ImGui::GetStyle().ItemSpacing.x*buttonCount+buttonInnerSize*buttonCount+ImGui::GetStyle().FramePadding.x*2*buttonCount;
         ImGui::AlignTextToFramePadding();
         ImGui::ScrollText(ImGui::GetID(rackNameID.c_str()),sysDef->name,ImVec2(0.0f,0.0f),ImVec2(ImGui::GetContentRegionAvail().x-sideButtonSize,0),false);
@@ -104,11 +161,32 @@ void FurnaceGUI::drawSysManager() {
           ImGui::SetTooltip(_("Clone"));
         }
         ImGui::SameLine();
+        // ajuste automatico de volume na troca de chip (liga/desliga, vale para todos os chips)
+        pushToggleColors(sysAutoVolume);
+        if (ImGui::Button(ICON_FA_MAGIC "##SysAutoVol")) {
+          sysAutoVolume=!sysAutoVolume;
+          e->setConf("sysAutoVolume",sysAutoVolume);
+        }
+        popToggleColors();
+        if (ImGui::IsItemHovered()) {
+          ImGui::SetTooltip(sysAutoVolume?
+            _("Automatic volume adjust: ON\nwhen changing this chip, the volume column, the volume macros\nand the chip mix are converted to the new chip's volume curve."):
+            _("Automatic volume adjust: OFF\nwhen changing this chip, volumes are kept as they are."));
+        }
+        ImGui::SameLine();
         ImGui::Button(ICON_FA_EJECT "##SysChange");
         if (ImGui::BeginPopupContextItem("SysPickerC",ImGuiPopupFlags_MouseButtonLeft)) {
           DivSystem picked=systemPicker(false);
           if (picked!=DIV_SYSTEM_NULL) {
-            if (e->changeSystem(i,picked,preserveChanPos)) {
+            bool changed=false;
+            String volReport;
+            if (sysAutoVolume) {
+              changed=e->changeSystemAdaptVolume(i,picked,preserveChanPos,volReport);
+            } else {
+              changed=e->changeSystem(i,picked,preserveChanPos);
+            }
+            if (changed) {
+              if (!volReport.empty()) showWarning(volReport,GUI_WARN_GENERIC);
               MARK_MODIFIED;
               recalcTimestamps=true;
               if (e->song.autoSystem) {

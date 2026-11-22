@@ -26,6 +26,8 @@
 // BR811: chip de som do console ficticio Ompreza (1984).
 // 5 canais. Cada canal escolhe uma "fonte" (0-7):
 //   0 = Onda A, 1 = Onda B, 2-7 = ruido (taxas diferentes).
+// A mesma classe emula o BR411 (portatil Ompreza P, 1988): 4 canais,
+// sem Onda B (a fonte 1 toca a Onda A) e sem PCM. Ver setBR411().
 class DivPlatformBR811: public DivDispatch {
   struct Channel: public SharedChannel {
     int source;     // fonte do som, 0 a 7
@@ -33,13 +35,15 @@ class DivPlatformBR811: public DivDispatch {
     bool dirty;     // precisa reescrever os registradores do chip
     bool pcm;       // canal 5: o instrumento atual e um sample (PCM)
     int sample;     // canal 5: numero do sample em uso
+    bool br411Ins;  // instrumento do tipo BR411 (fontes 0-6, sem a Onda B)
     Channel(bool linear=true, int initVol=15):
       SharedChannel(initVol,linear),
       source(0),
       period(0),
       dirty(true),
       pcm(false),
-      sample(-1) {}
+      sample(-1),
+      br411Ins(false) {}
   };
   Channel chan[5];
   DivDispatchOscBuffer* oscBuf[5];
@@ -59,6 +63,11 @@ class DivPlatformBR811: public DivDispatch {
   bool pcmActive;
   bool pcmVolumePlus; // chip de cartucho PCM Volume Plus presente (PCM com volume 0-30)
   int pcmMaxVol() { return pcmVolumePlus?30:15; }
+  bool br411; // emula o BR411 (Ompreza P) em vez do BR811
+  bool squareWaveA; // "BR811 corrigido": Onda A quadrada de verdade
+  // fonte do BR411 (0 Onda A, 1-6 ruido) -> fonte do BR811 (0 Onda A, 2-7 ruido)
+  static int br411Source(int v) { if (v<=0) return 0; if (v>6) v=6; return v+1; }
+  int chans;  // 5 no BR811, 4 no BR411
 
   void commit(int ch);
   void chipWrite(int ch, int reg, unsigned char val);
@@ -97,6 +106,8 @@ class DivPlatformBR811: public DivDispatch {
     void renderSamples(int chipID);
     bool getDCOffRequired();
     int init(DivEngine* parent, int channels, int sugRate, const DivConfig& flags);
+    // chamar antes de init(): troca o chip para o BR411
+    void setBR411(bool enable);
     void quit();
     DivPlatformBR811();
     ~DivPlatformBR811();

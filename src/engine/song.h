@@ -188,6 +188,9 @@ struct DivCompatFlags {
   bool limitSlides;
   // linear pitch
   unsigned char linearPitch;
+  // linearidade parcial (legado do DefleMask e do Furnace ate a versao 236).
+  // so vale com linearPitch==0: nota e slides no registrador, vibrato/E5xx multiplicativos.
+  bool partialPitch;
   unsigned char pitchSlideSpeed;
   // loop behavior
   // 0: reset on loop

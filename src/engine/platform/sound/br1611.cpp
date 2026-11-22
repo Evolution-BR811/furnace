@@ -12,6 +12,8 @@ namespace {
   const double LFO_HZ[8] = {3.98, 5.56, 6.02, 6.37, 6.88, 9.63, 48.1, 72.2};
   // profundidade do vibrato (FMS) em cents
   const double FMS_CENTS[8] = {0, 3.4, 6.7, 10, 14, 20, 40, 80};
+  // profundidade do tremolo (AMS) em dB, como no YM2612
+  const double AMS_DB[4] = {0, 1.4, 5.9, 11.8};
   // estéreo: 2 = 100%, 1 = 50%, 0 = desligado
   // posições: 0 esquerda, 1 meio-esquerda, 2 centro, 3 meio-direita, 4 direita
   const int PAN_L[5] = {2, 2, 2, 1, 0};
@@ -53,6 +55,7 @@ void BR1611::reset() {
     }
     pcm[c] = {false, 0, 0, 0, 0, 0};
     chOut[c] = 0;
+    fbHist[c][0] = fbHist[c][1] = 0;
     regs[0][0x20 + c] = 2; // estéreo começa no centro
   }
 }
@@ -190,12 +193,14 @@ void BR1611::envUpdate(Op& p, int ar, int d1, int d2, int rr, int sl, int rs, in
   }
 }
 
-int32_t BR1611::opStep(int ch, int o, int fn, int blk, double vib, int kc) {
+int32_t BR1611::opStep(int ch, int o, int fn, int blk, double vib, int kc, int32_t mod, int amAtt) {
   int i = o * 8 + ch;
   uint8_t r0 = regs[1][0x00 + i];
   int tl = regs[1][0x20 + i] & 0x7F;
   uint8_t r2 = regs[1][0x40 + i];
-  int d1 = regs[1][0x60 + i] & 31;
+  uint8_t r3 = regs[1][0x60 + i];
+  int d1 = r3 & 31;
+  bool am = r3 & 0x80;
   int d2 = regs[1][0x80 + i] & 31;
   uint8_t r5 = regs[1][0xA0 + i];
   int ssg = regs[1][0xC0 + i] & 15;
@@ -216,21 +221,24 @@ int32_t BR1611::opStep(int ch, int o, int fn, int blk, double vib, int kc) {
   double inc = (double)base * 2048.0 * (mul ? (double)mul : 0.5) * vib;
   p.phase += (uint32_t)(uint64_t)std::llround(inc);
 
-  // --- onda: 256 pontos interpolados para 1.024 ---
-  uint32_t pos = p.phase >> 22;         // 0-1023
-  int idx = pos >> 2, frac = pos & 3;
+  // --- onda: 256 pontos interpolados para 4.096, mais a modulacao ---
+  // (a modulacao chega na escala do OPN: saida de 14 bits = 1/2 ponto de
+  // um ciclo de 1.024 pontos por unidade, aqui x4 por ter 4.096 pontos)
+  uint32_t pos = ((p.phase >> 20) + (uint32_t)(mod * 2)) & 4095;
+  int idx = pos >> 4, frac = pos & 15;
   const uint8_t* w = wave[ch * 4 + o];
   int w0 = (int)w[idx] - 128;
   int w1 = (int)w[(idx + 1) & 255] - 128;
-  int v = w0 * 4 + (w1 - w0) * frac;    // cerca de -512 a 508
+  int v = w0 * 16 + (w1 - w0) * frac;   // cerca de -2048 a 2032
 
-  // --- atenuação: envelope + TL ---
+  // --- atenuacao: envelope + TL + tremolo ---
   int a = p.att >> 16;
   if (p.ssgInv) a = (a < 0x200) ? 0x200 - a : 0;
   a += tl * 8;
+  if (am) a += amAtt;
   if (a > 1023) a = 1023;
 
-  return (v * (int32_t)gainTab[a]) >> 8; // saída de 14 bits (cerca de ±8192)
+  return (v * (int32_t)gainTab[a]) >> 10; // saida de 14 bits (cerca de +-8192)
 }
 
 uint8_t BR1611::memAt(uint32_t addr) const {
@@ -344,15 +352,31 @@ int32_t BR1611::pcmStep(int ch, int fn, int blk, double vib, int kc) {
   return (s * (int32_t)gainTab[a]) >> 12;
 }
 
+// Ganho da saida: dobra o volume do chip (+6 dB). Um operador no maximo fica em
+// cerca de +-0,25 da escala, um pouco acima de um operador do YM2612 no Furnace.
+static const int32_t OUTPUT_GAIN = 2;
+
+// Limitador suave: ate 75% da escala o sinal passa intacto; acima disso ele e
+// comprimido aos poucos ate o maximo, em vez de cortar seco. So entra em acao
+// quando muitos canais estao no maximo ao mesmo tempo.
+static int16_t softLimit(int32_t x) {
+  const double T = 24576.0, M = 32767.0;
+  double a = std::fabs((double)x);
+  if (a <= T) return (int16_t)x;
+  double y = T + (M - T) * std::tanh((a - T) / (M - T));
+  return (int16_t)(x < 0 ? -y : y);
+}
+
 void BR1611::render(int16_t* outL, int16_t* outR, size_t count) {
   for (size_t n = 0; n < count; n++) {
-    // LFO único do chip (só vibrato)
+    // LFO unico do chip: vibrato (seno) e tremolo (0 a 1)
     bool lfoOn = regs[0][0x00] & 8;
-    double lfo = 0.0;
+    double lfo = 0.0, lfoAm = 0.0;
     if (lfoOn) {
       lfoPhase += LFO_HZ[regs[0][0x00] & 7] / SAMPLE_RATE;
       if (lfoPhase >= 1.0) lfoPhase -= 1.0;
       lfo = std::sin(2.0 * PI * lfoPhase);
+      lfoAm = 0.5 - 0.5 * std::cos(2.0 * PI * lfoPhase);
     }
 
     int32_t L = 0, R = 0;
@@ -370,17 +394,78 @@ void BR1611::render(int16_t* outL, int16_t* outR, size_t count) {
       if (isPcm(ch)) {
         sum = pcmStep(ch, fn, blk, vib, kc);
       } else {
-        for (int o = 0; o < OPS; o++) sum += opStep(ch, o, fn, blk, vib, kc);
-        // equilibra a WMS com o PCM: 2 operadores no máximo = escala cheia
+        // algoritmo e feedback (registrador $28 + canal), como no OPN.
+        // operadores na ordem dos registradores: 0 = OP1, 1 = OP3, 2 = OP2, 3 = OP4
+        int alg = regs[0][0x28 + ch] & 7;
+        int fb = (regs[0][0x28 + ch] >> 3) & 7;
+        int ams = regs[0][0x50 + ch] & 3;
+        int amAtt = lfoOn ? (int)std::lround(AMS_DB[ams] / 0.09375 * lfoAm) : 0;
+        int32_t fbMod = fb ? ((fbHist[ch][0] + fbHist[ch][1]) >> (10 - fb)) : 0;
+        int32_t o1 = opStep(ch, 0, fn, blk, vib, kc, fbMod, amAtt);
+        fbHist[ch][1] = fbHist[ch][0];
+        fbHist[ch][0] = o1;
+        int32_t o2, o3, o4;
+        switch (alg) {
+          case 0: // 1>2>3>4
+            o2 = opStep(ch, 2, fn, blk, vib, kc, o1, amAtt);
+            o3 = opStep(ch, 1, fn, blk, vib, kc, o2, amAtt);
+            o4 = opStep(ch, 3, fn, blk, vib, kc, o3, amAtt);
+            sum = o4;
+            break;
+          case 1: // (1+2)>3>4
+            o2 = opStep(ch, 2, fn, blk, vib, kc, 0, amAtt);
+            o3 = opStep(ch, 1, fn, blk, vib, kc, o1 + o2, amAtt);
+            o4 = opStep(ch, 3, fn, blk, vib, kc, o3, amAtt);
+            sum = o4;
+            break;
+          case 2: // (1+(2>3))>4
+            o2 = opStep(ch, 2, fn, blk, vib, kc, 0, amAtt);
+            o3 = opStep(ch, 1, fn, blk, vib, kc, o2, amAtt);
+            o4 = opStep(ch, 3, fn, blk, vib, kc, o1 + o3, amAtt);
+            sum = o4;
+            break;
+          case 3: // ((1>2)+3)>4
+            o2 = opStep(ch, 2, fn, blk, vib, kc, o1, amAtt);
+            o3 = opStep(ch, 1, fn, blk, vib, kc, 0, amAtt);
+            o4 = opStep(ch, 3, fn, blk, vib, kc, o2 + o3, amAtt);
+            sum = o4;
+            break;
+          case 4: // (1>2) + (3>4)
+            o2 = opStep(ch, 2, fn, blk, vib, kc, o1, amAtt);
+            o3 = opStep(ch, 1, fn, blk, vib, kc, 0, amAtt);
+            o4 = opStep(ch, 3, fn, blk, vib, kc, o3, amAtt);
+            sum = o2 + o4;
+            break;
+          case 5: // 1>(2, 3, 4)
+            o2 = opStep(ch, 2, fn, blk, vib, kc, o1, amAtt);
+            o3 = opStep(ch, 1, fn, blk, vib, kc, o1, amAtt);
+            o4 = opStep(ch, 3, fn, blk, vib, kc, o1, amAtt);
+            sum = o2 + o3 + o4;
+            break;
+          case 6: // (1>2) + 3 + 4
+            o2 = opStep(ch, 2, fn, blk, vib, kc, o1, amAtt);
+            o3 = opStep(ch, 1, fn, blk, vib, kc, 0, amAtt);
+            o4 = opStep(ch, 3, fn, blk, vib, kc, 0, amAtt);
+            sum = o2 + o3 + o4;
+            break;
+          default: // 1 + 2 + 3 + 4
+            o2 = opStep(ch, 2, fn, blk, vib, kc, 0, amAtt);
+            o3 = opStep(ch, 1, fn, blk, vib, kc, 0, amAtt);
+            o4 = opStep(ch, 3, fn, blk, vib, kc, 0, amAtt);
+            sum = o1 + o2 + o3 + o4;
+            break;
+        }
+        // equilibra a WMS com o PCM: 2 operadores no maximo = escala cheia
         sum = clamp16(sum * 2);
       }
 
       int32_t out = (sum * vol) >> 9;
-      chOut[ch] = out;
+      chOut[ch] = out;            // osciloscopio na escala de antes
+      out *= OUTPUT_GAIN;
       L += (out * PAN_L[pan]) >> 1;
       R += (out * PAN_R[pan]) >> 1;
     }
-    outL[n] = (int16_t)clamp16(L);
-    outR[n] = (int16_t)clamp16(R);
+    outL[n] = softLimit(L);
+    outR[n] = softLimit(R);
   }
 }

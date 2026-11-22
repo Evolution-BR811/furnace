@@ -406,6 +406,17 @@ struct DivPitchTable {
   virtual int get(int base, int pitch1, int pitch2);
 
   /**
+   * linearidade parcial (legado do DefleMask e do Furnace ate a versao 236).
+   * a nota e os slides (01xx/02xx/03xx) andam no registrador de periodo/frequencia,
+   * como na pitch nao linear, mas o vibrato e o ajuste fino (E5xx) sao aplicados
+   * multiplicando por 2^(pitch/1536), como no Furnace antigo.
+   * o motor atualiza estes valores a cada tick a partir das flags de compatibilidade.
+   */
+  static bool legacyPartial;
+  static bool legacyPitchMacroLinear;
+  static int legacyPartialFreq(int base, int pitch, int pitch2, bool period);
+
+  /**
    * get the base frequency of a note.
    * in linear pitch, it is an 8.7 fixed point number where the integer part is the note.
    * in non-linear pitch, it is the period or frequency as taken from the array and shifted by the octave.
@@ -609,7 +620,8 @@ struct SharedChannel {
     if (rawFreq) return baseFreq+pitch2;
     if (pitchTable==NULL) return 0;
     if (!pitchTable->linearity) {
-      return pitchTable->get(baseFreq,pitch*pitchMult,pitch2);
+      // na linearidade parcial o pitch e multiplicativo, entao nao passa pelo pitchMult
+      return pitchTable->get(baseFreq,DivPitchTable::legacyPartial?pitch:(pitch*pitchMult),pitch2);
     }
     if (fixedArp) {
       return pitchTable->get(baseNoteOverride<<7,pitch,pitch2);
