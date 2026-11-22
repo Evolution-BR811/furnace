@@ -797,6 +797,7 @@ src/engine/fileOps/mod.cpp
 src/engine/fileOps/s3m.cpp
 src/engine/fileOps/text.cpp
 src/engine/fileOps/tfm.cpp
+src/engine/fileOps/vgm.cpp
 src/engine/fileOps/xm.cpp
 
 src/engine/fileOps/p.cpp
@@ -830,6 +831,7 @@ src/engine/legacySample.cpp
 src/engine/macroInt.cpp
 src/engine/pattern.cpp
 src/engine/pitchTable.cpp
+src/engine/volumeAdapt.cpp
 src/engine/playback.cpp
 src/engine/sample.cpp
 src/engine/song.cpp
@@ -903,7 +905,10 @@ src/engine/platform/supervision.cpp
 src/engine/platform/scvtone.cpp
 src/engine/platform/pv1000.cpp
 src/engine/platform/br811.cpp
+src/engine/platform/br1611.cpp
+src/engine/platform/pwm32x.cpp
 src/engine/platform/sound/br811.cpp
+src/engine/platform/sound/br1611.cpp
 src/engine/platform/k053260.cpp
 src/engine/platform/ted.cpp
 src/engine/platform/c140.cpp
@@ -1026,6 +1031,7 @@ src/gui/insEdit/powernoise.cpp
 src/gui/insEdit/powernoiseslope.cpp
 src/gui/insEdit/pv1000.cpp
 src/gui/insEdit/br811.cpp
+src/gui/insEdit/br1611.cpp
 src/gui/insEdit/qsound.cpp
 src/gui/insEdit/rf5c68.cpp
 src/gui/insEdit/saa1099.cpp

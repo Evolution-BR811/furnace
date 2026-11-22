@@ -378,6 +378,17 @@ void FurnaceGUI::drawSampleWarning(DivSample* sample, int index, String &warnLoo
         SAMPLE_WARN(warnLength,_("BR811: maximum sample length is 4096"));
       }
       break;
+    case DIV_SYSTEM_BR1611:
+      if (sample->depth!=DIV_SAMPLE_DEPTH_16BIT && sample->depth!=DIV_SAMPLE_DEPTH_8BIT && sample->depth!=DIV_SAMPLE_DEPTH_4BIT && sample->depth!=DIV_SAMPLE_DEPTH_BRR) {
+        SAMPLE_WARN(warnLength,_("BR1611: this format will be played as 16-bit PCM (BRR = CP)"));
+      }
+      if (sample->depth==DIV_SAMPLE_DEPTH_BRR && sample->loop && (sample->loopStart&15)) {
+        SAMPLE_WARN(warnLoopPos,_("BR1611: CP loop start will be aligned to 16 samples"));
+      }
+      if (sample->depth==DIV_SAMPLE_DEPTH_BRR) {
+        SAMPLE_WARN(warnLength,_("BR1611: BRR samples are played as CP (Compression PCM)"));
+      }
+      break;
     case DIV_SYSTEM_SUPERVISION:
       if (sample->loop) {
         if (sample->loopStart!=0 || sample->loopEnd!=(int)(sample->samples)) {

@@ -324,6 +324,15 @@ void FurnaceGUI::drawCompatFlags() {
         if (ImGui::IsItemHovered()) {
           ImGui::SetTooltip(_("like Impulse Tracker"));
         }
+        ImGui::BeginDisabled(e->song.compatFlags.linearPitch);
+        if (ImGui::Checkbox(_("Partial (legacy)"),&e->song.compatFlags.partialPitch)) {
+          e->notifyPitchTable();
+          MARK_MODIFIED;
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+          ImGui::SetTooltip(_("like DefleMask and Furnace before 0.6.9 (only with None):\nnotes and pitch slides (01xx/02xx/03xx) work on the frequency register,\nwhile vibrato and fine pitch (E5xx) are linear.\nold songs that used partial pitch linearity load with this enabled."));
+        }
         ImGui::Unindent();
 
         if (e->song.compatFlags.linearPitch) {

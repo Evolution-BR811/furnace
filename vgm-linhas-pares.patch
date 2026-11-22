@@ -1,0 +1,203 @@
+From 095321abbce2ca7d48d7007c57be823e98214788 Mon Sep 17 00:00:00 2001
+From: Evolution BR811 <344454957+Evolution-BR811@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 19:08:28 -0400
+Subject: [PATCH] VGM/NSF import: notes on even rows when possible
+
+The importer converts each song (and each NSF track) with both row grids
+and keeps notes on even rows (0, 2, 4...) whenever that needs no more
+instruments and approximates no more notes than the usual grid.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KMJUrc1fn7dir5w2PfSPK2
+---
+ src/engine/fileOps/vgm.cpp | 88 +++++++++++++++++++++++++++++++++-----
+ 1 file changed, 77 insertions(+), 11 deletions(-)
+
+diff --git a/src/engine/fileOps/vgm.cpp b/src/engine/fileOps/vgm.cpp
+index 8686c88..c9cf1d3 100644
+--- a/src/engine/fileOps/vgm.cpp
++++ b/src/engine/fileOps/vgm.cpp
+@@ -688,8 +688,55 @@ struct VGMNESContext {
+   // pitch mode of the song (-1: not decided yet, 0: linear, 1: periods).
+   // the first subsong decides, the others follow (it is one song setting)
+   int pitchMode=-1;
++  // row grid: 0 the usual one, 1 notes on even rows (if that grid is valid)
++  int gridMode=0;
++  // notes that had to use the closest instrument (instrument limit)
++  int mergedNotes=0;
+ };
+ 
++bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong* sub, std::vector<String>& warns, String& err);
++
++// converts on a scratch copy of the song with both row grids, and returns the
++// one to use: notes on even rows (1) if that needs no more instruments and
++// approximates no more notes than the usual grid (0)
++static int vgmPickGrid(const VGMNESLog& log, const VGMNESContext& ctx, const DivSong& ds) {
++  int score[2]={-1,-1};
++  int ins[2]={0,0};
++  for (int m=0; m<2; m++) {
++    DivSong t=ds;
++    // deep copies, so instruments shared with earlier tracks can be reused
++    // (and renamed) without touching the real ones
++    for (DivInstrument*& i: t.ins) i=new DivInstrument(*i);
++    size_t smpBefore=t.sample.size();
++    t.wave.clear();
++    size_t insBefore=t.ins.size();
++    t.subsong.clear();
++    DivSubSong* sub=new DivSubSong;
++    t.subsong.push_back(sub);
++    VGMNESLog l=log;
++    VGMNESContext c=ctx;
++    c.gridMode=m;
++    c.mergedNotes=0;
++    std::vector<String> w;
++    String e;
++    if (vgmConvertNES(l,c,t,sub,w,e)) {
++      ins[m]=(int)(t.ins.size()-insBefore);
++      score[m]=c.mergedNotes*1000+ins[m];
++    }
++    for (DivInstrument* i: t.ins) delete i;
++    for (size_t i=smpBefore; i<t.sample.size(); i++) delete t.sample[i];
++    for (DivSubSong* i: t.subsong) {
++      i->clearData();
++      delete i;
++    }
++  }
++  if (score[1]>=0 && score[0]>=0 && score[1]<=score[0]) {
++    logI("VGM import: notes on even rows (%d instruments, %d with the usual rows)",ins[1],ins[0]);
++    return 1;
++  }
++  return 0;
++}
++
+ // turns an APU log into notes, instruments and effects in one subsong
+ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong* sub, std::vector<String>& warns, String& err) {
+     std::vector<VGMEvent>& events=log.events;
+@@ -1508,6 +1555,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     // notes closer than half a row to the previous one go in the same row with
+     // a delay (EDxx). R is chosen to get the fewest rows and speed changes.
+     std::vector<int> rowLen;
++    bool gridEven=false;
+     {
+       // anchor ticks and the channels that start a note there
+       std::map<int,int> anchorMask;
+@@ -1515,7 +1563,9 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       if (loopTick>0) anchorMask[loopTick]|=0;
+       std::vector<std::pair<int,int>> anchors(anchorMask.begin(),anchorMask.end());
+ 
+-      auto buildRows=[&](double R, std::vector<int>& out, int& invalid, int& absorbed, int& conflicts) {
++      // even: every gap between notes takes an even number of rows, so the
++      // notes land on rows 0, 2, 4... (easier to edit and to move around)
++      auto buildRows=[&](double R, bool even, std::vector<int>& out, int& invalid, int& absorbed, int& conflicts) {
+         out.clear();
+         invalid=0;
+         absorbed=0;
+@@ -1542,7 +1592,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+             curMask|=an.second;
+             continue;
+           }
+-          int k=(int)round((double)delta/R);
++          int k=even?(2*(int)round((double)delta/(2.0*R))):(int)round((double)delta/R);
+           // the loop point must start a row
+           if (k==0 && t!=loopTick) {
+             // same row as the current anchor, with a delay
+@@ -1564,14 +1614,16 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         }
+       };
+ 
+-      double bestCost=1e30;
+-      double bestR=1.0;
++      // the best grid of each kind (normal, even)
++      double bestCostK[2]={1e30,1e30};
++      double bestRK[2]={1.0,1.0};
+       int totalAnchors=(int)anchors.size();
+       std::vector<int> tmp;
+-      for (int ri=2400; ri>=100; ri--) {
++      for (int pass=0; pass<2; pass++) for (int ri=2400; ri>=100; ri--) {
++        const bool even=(pass==1);
+         double R=(double)ri/100.0;
+         int invalid, absorbed, conflicts;
+-        buildRows(R,tmp,invalid,absorbed,conflicts);
++        buildRows(R,even,tmp,invalid,absorbed,conflicts);
+         if (tmp.empty()) continue;
+         if (invalid*20>(int)tmp.size()) continue;
+         // notes a tick or two after the others (drivers often start some
+@@ -1583,14 +1635,21 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         int changes=0;
+         for (size_t j=1; j<tmp.size(); j++) if (tmp[j]!=tmp[j-1]) changes++;
+         double cost=(double)tmp.size()+(double)changes+3.0*(double)absorbed+4.0*(double)invalid+3.0*(double)conflicts;
+-        if (cost<bestCost) {
+-          bestCost=cost;
+-          bestR=R;
++        if (even) cost=(double)tmp.size()*0.5+(double)changes*0.5+3.0*(double)absorbed+4.0*(double)invalid+3.0*(double)conflicts;
++        if (cost<bestCostK[pass]) {
++          bestCostK[pass]=cost;
++          bestRK[pass]=R;
+         }
+       }
++      // notes on even rows when the loader picked that (it tries both and
++      // keeps it if it needs no more instruments), and the grid is valid
++      bool bestEven=(ctx.gridMode==1 && bestCostK[1]<1e29);
++      if (bestCostK[0]>=1e29) bestEven=(bestCostK[1]<1e29);
++      double bestR=bestRK[bestEven?1:0];
+       int invalid, absorbed, conflicts;
+-      buildRows(bestR,rowLen,invalid,absorbed,conflicts);
+-      logI("VGM import: row length %.2f ticks (%d rows, %d delayed notes)",bestR,(int)rowLen.size(),absorbed);
++      buildRows(bestR,bestEven,rowLen,invalid,absorbed,conflicts);
++      gridEven=bestEven;
++      logI("VGM import: row length %.2f ticks (%d rows, %d delayed notes)%s",bestR,(int)rowLen.size(),absorbed,bestEven?", notes on even rows":"");
+     }
+     const int shift=0;
+     std::vector<int> rowStart;
+@@ -1622,6 +1681,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       // on FM a new note restarts the chip's envelope: pitch changes without
+       // a key on stay in the note's macros
+       for (int r=1; r<numRows && c<12; r++) {
++        // (notes on even rows only, if that is the grid)
++        if (gridEven && (r&1)) continue;
+         int k=rowStart[r]-shift;
+         if (k<=0 || k>=numTicks) continue;
+         while (oi<onsets[c].size() && onsets[c][oi]<k) oi++;
+@@ -1647,6 +1708,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       for (int k: repeatCand[c]) {
+         int r=rowOf(k+shift);
+         if (r<0 || r>=numRows || rowStart[r]!=k+shift) continue;
++        if (gridEven && (r&1)) continue;
+         auto po=std::upper_bound(onsets[c].begin(),onsets[c].end(),k);
+         int o=(po==onsets[c].begin())?-1:*(po-1);
+         // the pitch moves like it did at the start of the note before
+@@ -2365,6 +2427,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+               if (hold<2 && j+hold<len) continue;
+               int r=rowOf(a+j+shift);
+               if (r<=lastRowUsed || r>=nextRowL || r>=offRow) continue;
++              if (gridEven && (r&1)) continue;
+               int d=(a+j+shift)-rowStart[r];
+               if (d>255) continue;
+               bounds.push_back(j);
+@@ -3625,6 +3688,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       }
+     }
+     logI("VGM import: %d note shapes, %d merged (%d notes), %d scaled matches, %d prefix matches",(int)sets.size(),mergedSets,mergedNotes,scaledMatches,prefixMatches);
++    ctx.mergedNotes+=mergedNotes;
+     if (mergedSets>0) {
+       warns.push_back(fmt::sprintf("this song has more note shapes than the 256 instrument limit: %d rare ones (%d notes) use the closest instrument instead, so they may sound slightly different",mergedSets,mergedNotes));
+     }
+@@ -4006,6 +4070,7 @@ bool DivEngine::loadVGM(unsigned char* file, size_t len) {
+     VGMNESContext ctx;
+     std::vector<String> warns;
+     String err;
++    ctx.gridMode=vgmPickGrid(log,ctx,ds);
+     if (!vgmConvertNES(log,ctx,ds,ds.subsong[0],warns,err)) {
+       lastError=err;
+       throw VGMInvalidException();
+@@ -5139,6 +5204,7 @@ bool DivEngine::loadNSF(unsigned char* file, size_t len) {
+       }
+       String trackName=(track-1<(int)nsf.trackNames.size() && !nsf.trackNames[track-1].empty())?nsf.trackNames[track-1]:fmt::sprintf("Track %d",track);
+       sub->name=trackName;
++      ctx.gridMode=vgmPickGrid(log,ctx,ds);
+       if (!vgmConvertNES(log,ctx,ds,sub,warns,err)) {
+         addWarning(fmt::sprintf("track %d: %s",track,err));
+         if (imported>0) {
+-- 
+2.43.0
+

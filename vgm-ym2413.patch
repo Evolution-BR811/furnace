@@ -1,0 +1,949 @@
+From 23032d4b04d1d1a54182ca10f762f022075b7358 Mon Sep 17 00:00:00 2001
+From: Evolution BR811 <344454957+Evolution-BR811@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:43:14 -0400
+Subject: [PATCH] VGM import: YM2413 (MSX-MUSIC, Master System FM) and VRC7
+
+- notes are key ons; the chip's own envelope plays them
+- preset patches go to the instrument (wave macro when the patch changes
+  inside a note), the custom patch becomes the instrument's operators
+- changes to the custom patch during a note become FM macros of the
+  note that owns it; a key on inside a row becomes a phase reset macro
+- rhythm mode imports as "OPLL with drums" (18xx when it is switched)
+- pitch matched exactly through Furnace's own f-num calculation
+- works alongside the SN76489 (Master System FM) and the 2A03 (VRC7)
+- leading silent ticks are no longer added before the first write
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KMJUrc1fn7dir5w2PfSPK2
+---
+ src/engine/fileOps/vgm.cpp | 565 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 512 insertions(+), 53 deletions(-)
+
+diff --git a/src/engine/fileOps/vgm.cpp b/src/engine/fileOps/vgm.cpp
+index 3aa8878..e02c1be 100644
+--- a/src/engine/fileOps/vgm.cpp
++++ b/src/engine/fileOps/vgm.cpp
+@@ -34,8 +34,15 @@
+ //
+ // a afinacao usa a propria tabela de periodos do Furnace ao contrario, entao
+ // cada periodo do jogo e reproduzido exatamente (nota + ajuste fino).
++//
++// YM2413 (OPLL) e VRC7: a nota e o key on (o envelope e do chip). o patch
++// vai para o instrumento (e para a macro de wave quando muda dentro da nota),
++// o patch custom vira os operadores do instrumento, mudancas nele durante a
++// nota viram macros FM, e um key on no meio da nota vira macro de phase reset.
++// o modo de ritmo usa o sistema "OPLL with drums" (18xx quando liga/desliga).
+ 
+ #include "fileOpsCommon.h"
++#include "../bsr.h"
+ #include <algorithm>
+ #include <map>
+ #include <set>
+@@ -85,6 +92,9 @@ struct VGMChanTick {
+   int noise=0;         // noise period (shared by the 3 channels)
+   int envShape=0, envPeriod=0;
+   bool envRestart=false; // envelope shape written in this tick
++  // YM2413/VRC7 only: the sound (patch, sustain, custom patch) of the channel,
++  // an index into the converter's table of FM sounds
++  int fm=-1;
+ };
+ 
+ struct VGMDPCMTrigger {
+@@ -622,11 +632,22 @@ struct VGMNESLog {
+   bool snStereo=false;
+   double snClock=3579545.0;
+   double snNoiseDivider=64.0;
++  // YM2413 (OPLL) or VRC7: events with reg 0x300+register
++  bool hasOPLL=false;
++  bool opllVRC7=false;
++  bool opllDrums=false; // rhythm mode is used at some point
++  double opllClock=3579545.0;
+ };
+ 
+ // the macros of one note (an instrument candidate)
+ struct VGMMacroSet {
+-  int type; // 0: pulse, 2: triangle, 3: noise, 4: Sunsoft 5B
++  int type; // 0: pulse, 2: triangle, 3: noise, 4: Sunsoft 5B, 5/6: SN76489, 7: OPLL, 8: OPLL drums
++  int fm=-1; // OPLL: the FM sound (an instrument only plays one)
++  // OPLL: custom patch fields that change during the note (FM macros):
++  // (field, values) and the loop of each, and all of it as a key
++  std::vector<std::pair<int,std::vector<int>>> fmMac;
++  std::vector<int> fmMacLoop;
++  String fmKey;
+   // vol, duty (5B: mixer), arp, pitch, 5B noise frequency, 5B envelope shape
+   std::vector<int> v[6];
+   int loop[6];
+@@ -753,8 +774,10 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           double icpt=(sy-slope*sx)/(double)cnt;
+           if (fabs(slope-period)<period*0.02) {
+             period=slope;
+-            // first frame start, never after the first burst
++            // first frame start, never after the first burst (and not whole
++            // frames before it either: those would only be silence)
+             t0=std::min(icpt,bursts.front());
++            while (t0+period<=bursts.front()) t0+=period;
+           }
+         }
+       }
+@@ -776,12 +799,16 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     // --- step 3: simulate the 2A03 tick by tick ---
+     // channels: 0-4 2A03 (4 is the DMC), 5-7 Sunsoft 5B
+     // internal channels: 0-3 2A03, 4 DMC, 5-7 Sunsoft 5B, 8-11 SN76489
+-    // (8-10 square, 11 noise). patIdx maps them to the song's channels.
+-    std::vector<VGMChanTick> chanTicks[12];
+-    for (int c=0; c<12; c++) chanTicks[c].resize(numTicks);
++    // (8-10 square, 11 noise), 12-20 YM2413/VRC7 FM, 21-25 YM2413 drums
++    // (kick, snare, tom, top, hi-hat). patIdx maps them to the song's
++    // channels (FM 7-9 and the first three drums share theirs, like in
++    // Furnace's "OPLL with drums").
++    const int NCH=26;
++    std::vector<VGMChanTick> chanTicks[NCH];
++    for (int c=0; c<NCH; c++) chanTicks[c].resize(numTicks);
+     std::vector<int> tonal;
+-    int patIdx[12];
+-    for (int c=0; c<12; c++) patIdx[c]=-1;
++    int patIdx[NCH];
++    for (int c=0; c<NCH; c++) patIdx[c]=-1;
+     int numChans=0;
+     if (log.hasNES) {
+       for (int c=0; c<5; c++) patIdx[c]=numChans++;
+@@ -799,8 +826,24 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         tonal.push_back(c);
+       }
+     }
++    const int opllFM=log.opllVRC7?6:9;
++    if (log.hasOPLL) {
++      int base=numChans;
++      for (int c=0; c<opllFM; c++) {
++        patIdx[12+c]=base+c;
++        tonal.push_back(12+c);
++      }
++      numChans+=opllFM;
++      if (log.opllDrums) {
++        for (int d=0; d<5; d++) {
++          patIdx[21+d]=base+6+d;
++          tonal.push_back(21+d);
++        }
++        numChans=base+11;
++      }
++    }
+     // song commands (speed, grooves, loop) go in the first channel
+-    const int cmdChan=log.hasNES?0:(log.has5B?5:8);
++    const int cmdChan=log.hasNES?0:(log.has5B?5:(log.hasSN?8:12));
+     unsigned char ayRegs[16];
+     memset(ayRegs,0,16);
+     ayRegs[7]=0x3f;
+@@ -808,6 +851,50 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     int snAtt[4]={15,15,15,15};
+     int snNoise=0, snLatch=0, snPan=0xff;
+     bool snLatchVol=false;
++    // YM2413/VRC7 registers, and the FM sounds the channels play: the preset
++    // patches (1-15, the patch number itself goes to the wave macro) or the
++    // custom patch (0, with its 8 registers), plus the channel's sustain
++    // bit. the drums are one sound of their own.
++    unsigned char opllRegs[64];
++    memset(opllRegs,0,64);
++    struct VGMFMSound {
++      int inst;
++      bool sus;
++      bool drum;
++      unsigned char cust[8];
++    };
++    std::vector<VGMFMSound> fmSounds;
++    std::vector<String> fmSoundKeys;
++    std::map<String,int> fmSoundMap;
++    auto fmSoundOf=[&](int inst, bool sus, bool drum) -> int {
++      VGMFMSound fs;
++      fs.inst=drum?16:((inst==0)?0:1);
++      fs.sus=drum?false:sus;
++      fs.drum=drum;
++      memset(fs.cust,0,8);
++      if (!drum && inst==0) memcpy(fs.cust,opllRegs,8);
++      String k=fmt::sprintf("%d|%d|%d|",fs.inst,fs.sus?1:0,fs.drum?1:0);
++      for (int i=0; i<8; i++) k+=fmt::sprintf("%.2x",fs.cust[i]);
++      auto it=fmSoundMap.find(k);
++      if (it!=fmSoundMap.end()) return it->second;
++      fmSounds.push_back(fs);
++      fmSoundKeys.push_back(k);
++      fmSoundMap[k]=(int)fmSounds.size()-1;
++      return (int)fmSounds.size()-1;
++    };
++    // fnum<<block, the pitch of an FM channel (the same for any block)
++    auto opllPitch=[&](int ch) -> int {
++      int fnum=opllRegs[0x10+ch]|((opllRegs[0x20+ch]&1)<<8);
++      int block=(opllRegs[0x20+ch]>>1)&7;
++      return fnum<<block;
++    };
++    // rhythm mode per tick (for the 18xx switches), and the custom patch
++    std::vector<bool> opllRhythm;
++    std::vector<unsigned char> opllCust;
++    if (log.hasOPLL) {
++      opllRhythm.resize(numTicks,false);
++      opllCust.resize((size_t)numTicks*8,0);
++    }
+     std::vector<VGMDPCMTrigger> triggers;
+     std::vector<VGMDPCMStop> stops;
+     VGMNESApu* apu=new VGMNESApu;
+@@ -823,8 +910,25 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       bool restart[4]={false,false,false,false};
+       bool envRestart=false;
+       bool snNoiseRestart=false;
++      bool opllKeyOn[14];
++      for (int i=0; i<14; i++) opllKeyOn[i]=false;
+       while (evPos<events.size() && events[evPos].time<=snap) {
+         VGMEvent& e=events[evPos++];
++        if (e.reg>=0x300) {
++          int a=e.reg&0xff;
++          if (a>=64) continue;
++          // a key that goes from off to on in this tick starts a note, even
++          // if it was already on at the last tick (key off + key on)
++          if (a>=0x20 && a<=0x28 && (e.val&0x10) && !(opllRegs[a]&0x10)) opllKeyOn[a-0x20]=true;
++          if (a==0x0e) {
++            for (int d=0; d<5; d++) {
++              int bit=0x10>>d;
++              if ((e.val&bit) && !(opllRegs[a]&bit)) opllKeyOn[9+d]=true;
++            }
++          }
++          opllRegs[a]=e.val;
++          continue;
++        }
+         if (e.reg==0x200) {
+           int b=e.val;
+           if (b&0x80) {
+@@ -899,6 +1003,47 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           chanTicks[8+i][k]=t;
+         }
+       }
++      if (log.hasOPLL) {
++        const bool rhythm=(opllRegs[0x0e]&0x20) && !log.opllVRC7;
++        opllRhythm[k]=rhythm;
++        memcpy(&opllCust[(size_t)k*8],opllRegs,8);
++        for (int i=0; i<opllFM; i++) {
++          VGMChanTick t;
++          // in rhythm mode FM 7-9 play the drums
++          bool key=(opllRegs[0x20+i]&0x10) && !(rhythm && i>=6);
++          int inst=opllRegs[0x30+i]>>4;
++          t.aud=key;
++          t.period=opllPitch(i);
++          t.vol=key?(15-(opllRegs[0x30+i]&15)):0;
++          t.restart=opllKeyOn[i];
++          t.duty=inst;
++          t.fm=fmSoundOf(inst,opllRegs[0x20+i]&0x20,false);
++          chanTicks[12+i][k]=t;
++        }
++        if (log.opllDrums) {
++          // kick, snare, tom, top, hi-hat: their key bit, volume and the FM
++          // channel whose pitch they use (Furnace writes the same ones)
++          static const int slot[5]={6,7,8,8,7};
++          int att[5]={
++            opllRegs[0x36]&15,
++            opllRegs[0x37]&15,
++            opllRegs[0x38]>>4,
++            opllRegs[0x38]&15,
++            opllRegs[0x37]>>4
++          };
++          int drumSound=fmSoundOf(16,false,true);
++          for (int d=0; d<5; d++) {
++            VGMChanTick t;
++            bool key=rhythm && (opllRegs[0x0e]&(0x10>>d));
++            t.aud=key;
++            t.period=opllPitch(slot[d]);
++            t.vol=key?(15-att[d]):0;
++            t.restart=opllKeyOn[9+d];
++            t.fm=drumSound;
++            chanTicks[21+d][k]=t;
++          }
++        }
++      }
+       if (log.has5B) {
+         for (int i=0; i<3; i++) {
+           VGMChanTick t;
+@@ -1073,8 +1218,58 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         periodOffsetSNNoise=periodOffsetSN;
+       }
+     }
++    // and for the YM2413/VRC7: Furnace computes a frequency from its table
++    // and picks the block itself (frequency/343), so the pitch to match is
++    // fnum<<block, whatever block the driver used
++    std::vector<int> pitchOffsetOPLL;
++    if (log.hasOPLL) {
++      DivPitchTable ptO;
++      ptO.init(ds.tuning,log.opllClock,1180068,0xffff,false,true);
++      const int span=1<<16;
++      pitchOffsetOPLL.assign(span,-1);
++      for (int off=0; off<180*128; off++) {
++        int f=ptO.get(off,0,0);
++        if (f<0) f=0;
++        if (f>65535) f=65535;
++        int block=f/343;
++        if (block>0) block=bsr(block);
++        if (block>7) block=7;
++        int fnum=f>>block;
++        if (fnum>0x1ff) fnum=0x1ff;
++        int L=fnum<<block;
++        // a whole note wins
++        if ((off&127)==0 || pitchOffsetOPLL[L]<0) {
++          if (pitchOffsetOPLL[L]<0 || (pitchOffsetOPLL[L]&127)!=0) pitchOffsetOPLL[L]=off;
++        }
++      }
++      // pitches the table can't hit: the closest one it can
++      std::vector<int> lo(span,-1), hi(span,-1);
++      int last=-1;
++      for (int L=0; L<span; L++) {
++        if (pitchOffsetOPLL[L]>=0) last=L;
++        lo[L]=last;
++      }
++      last=-1;
++      for (int L=span-1; L>=0; L--) {
++        if (pitchOffsetOPLL[L]>=0) last=L;
++        hi[L]=last;
++      }
++      for (int L=0; L<span; L++) {
++        if (pitchOffsetOPLL[L]>=0) continue;
++        int pick=-1;
++        if (lo[L]<0) {
++          pick=hi[L];
++        } else if (hi[L]<0) {
++          pick=lo[L];
++        } else {
++          pick=(L-lo[L]<=hi[L]-L)?lo[L]:hi[L];
++        }
++        pitchOffsetOPLL[L]=(pick>=0)?pitchOffsetOPLL[pick]:0;
++      }
++    }
+     // offset of a tick (noise: note number*128)
+     auto tickOffset=[&](int c, const VGMChanTick& t) -> int {
++      if (c>=12) return pitchOffsetOPLL[t.period&0xffff];
+       if (c==11) {
+         // SN noise: Furnace takes note%12 = 0, 1, 2 for the fixed rates 2, 1, 0
+         // (C-4, C#4, D-4 here), or a pitch when it borrows square 3's period
+@@ -1091,7 +1286,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     };
+ 
+     // --- step 6: note onsets (first pass) ---
+-    std::vector<int> onsets[12];
++    std::vector<int> onsets[NCH];
+     for (int c: tonal) {
+       std::vector<VGMChanTick>& ct=chanTicks[c];
+       for (int k=0; k<numTicks; k++) {
+@@ -1100,6 +1295,12 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           onsets[c].push_back(k);
+           continue;
+         }
++        // FM: a note is a key on, nothing else (the chip's own envelope
++        // starts there; volume and pitch changes go into the note)
++        if (c>=12) {
++          if (ct[k].restart) onsets[c].push_back(k);
++          continue;
++        }
+         // pitch changes alone are not new notes here (arpeggios and vibrato
+         // also rewrite the period); legato notes are found later on row starts.
+         // the triangle has no volume, so only silence tells its notes apart.
+@@ -1117,7 +1318,9 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     }
+     // a "note" one tick after another one on the same channel is almost always
+     // the driver finishing the attack (volume set a frame later): merge it
++    // (an FM key on is always a note)
+     for (int c: tonal) {
++      if (c>=12) continue;
+       std::vector<int> kept;
+       for (int k: onsets[c]) {
+         if (!kept.empty() && k-kept.back()<=1) continue;
+@@ -1144,7 +1347,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     {
+       // anchor ticks and the channels that start a note there
+       std::map<int,int> anchorMask;
+-      for (int c=0; c<12; c++) for (int t: onsets[c]) anchorMask[t]|=(1<<c);
++      for (int c=0; c<NCH; c++) for (int t: onsets[c]) anchorMask[t]|=(1<<c);
+       if (loopTick>0) anchorMask[loopTick]|=0;
+       std::vector<std::pair<int,int>> anchors(anchorMask.begin(),anchorMask.end());
+ 
+@@ -1249,7 +1452,9 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       std::vector<VGMChanTick>& ct=chanTicks[c];
+       std::vector<int> extra;
+       size_t oi=0;
+-      for (int r=1; r<numRows; r++) {
++      // on FM a new note restarts the chip's envelope: pitch changes without
++      // a key on stay in the note's macros
++      for (int r=1; r<numRows && c<12; r++) {
+         int k=rowStart[r]-shift;
+         if (k<=0 || k>=numTicks) continue;
+         while (oi<onsets[c].size() && onsets[c][oi]<k) oi++;
+@@ -1299,7 +1504,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     for (int c=0; c<numChans; c++) {
+       for (int o=0; o<numOrders; o++) sub->orders.ord[c][o]=o;
+     }
+-    int maxFxCol[12]={1,1,1,1,1,1,1,1,1,1,1,1};
++    int maxFxCol[NCH];
++    for (int c=0; c<NCH; c++) maxFxCol[c]=1;
+     auto cellAt=[&](int c, int row) -> short* {
+       if (row<0) row=0;
+       if (row>=numRows) row=numRows-1;
+@@ -1678,7 +1884,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     // more instruments there)
+     std::map<String,std::set<int>> adsrFamilies;
+     for (int c: tonal) {
+-      if (c==2) continue;
++      if (c==2 || c>=12) continue;
+       std::vector<VGMChanTick>& ct=chanTicks[c];
+       std::vector<int>& on=onsets[c];
+       for (size_t i=0; i<on.size(); i++) {
+@@ -1696,6 +1902,24 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         adsrFamilies[fk].insert(fe-fa);
+       }
+     }
++    // YM2413 custom patch: there is only one, shared by the channels. a change
++    // to it belongs to the latest note that started with the custom patch
++    // (its instrument gets FM macros), until another one starts.
++    std::vector<int> customOnsets;
++    if (log.hasOPLL) {
++      for (int c=12; c<12+opllFM; c++) {
++        for (int k: onsets[c]) if (chanTicks[c][k].duty==0) customOnsets.push_back(k);
++      }
++      std::sort(customOnsets.begin(),customOnsets.end());
++    }
++    // the custom patch fields: register, shift, mask
++    static const int fmField[24][3]={
++      {0,7,1},{0,6,1},{0,5,1},{0,4,1},{0,0,15},
++      {1,7,1},{1,6,1},{1,5,1},{1,4,1},{1,0,15},
++      {2,0,63},{2,6,3},{3,6,3},{3,4,1},{3,3,1},{3,0,7},
++      {4,4,15},{4,0,15},{5,4,15},{5,0,15},
++      {6,4,15},{6,0,15},{7,4,15},{7,0,15}
++    };
+     // build the notes twice, with and without envelopes with a release, and
+     // keep whichever needs fewer instruments (the release helps game drivers
+     // a lot, but can split music whose volume only decays)
+@@ -1714,7 +1938,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         std::vector<VGMChanTick>& ct=chanTicks[c];
+         std::vector<int>& on=onsets[c];
+         const bool is5B=(c>=5 && c<8);
+-        const bool isSN=(c>=8);
++        const bool isSN=(c>=8 && c<12);
++        const bool isOPLL=(c>=12);
+         size_t i=0;
+         while (i<on.size()) {
+           int a=on[i];
+@@ -1734,7 +1959,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           // it) in the instrument; the release itself becomes an E7xx
+           int adsrA=-1, adsrEnd=-1;
+           bool adsr=false;
+-          if (c!=2) {
++          // (not on FM: the end of an FM note is a key off, never a volume)
++          if (c!=2 && !isOPLL) {
+             std::vector<int> rv;
+             for (int k=a; k<std::min(next,s+1); k++) rv.push_back(ct[k].vol);
+             adsr=vgmFindADSR(rv,adsrA,adsrEnd);
+@@ -1816,6 +2042,16 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           // a 5B note without noise doesn't need the noise macro (it is shared,
+           // and would change the noise of the other channels)
+           if (!usesNoise) vNoise.clear();
++          // FM: a key on inside the note (two notes in one row) is a phase
++          // reset macro, which keys the channel on again (slot 5)
++          if (isOPLL) {
++            int lastR=0;
++            for (int k=a+1; k<macroEnd; k++) if (ct[k].restart && ct[k].aud) lastR=k-a;
++            if (lastR>0) {
++              vEnv.assign(lastR+2,0);
++              for (int k=a+1; k<=a+lastR; k++) if (ct[k].restart && ct[k].aud) vEnv[k-a]=1;
++            }
++          }
+           // a constant fine tune goes to E5xx in the pattern, the rest to the pitch macro
+           int fine=0;
+           if (c!=3) {
+@@ -1835,7 +2071,38 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           // what this note plays, tick by tick (to compare with instruments)
+           std::vector<int> rawV[6]={vVol,vDuty,vArp,vPitch,vNoise,vEnv};
+           VGMMacroSet ms;
+-          ms.type=isSN?((c==11)?6:5):(is5B?4:((c<2)?0:c));
++          ms.type=isOPLL?((c>=21)?8:7):(isSN?((c==11)?6:5):(is5B?4:((c<2)?0:c)));
++          ms.fm=isOPLL?ct[a].fm:-1;
++          if (isOPLL && c<21) {
++            // a note that switches to the custom patch takes its registers
++            for (int k=a; k<macroEnd; k++) {
++              if (ct[k].aud && ct[k].duty==0) {
++                ms.fm=ct[k].fm;
++                break;
++              }
++            }
++            // changes to the custom patch while this note owns it
++            if (ct[a].duty==0) {
++              int wEnd=numTicks;
++              auto wi=std::upper_bound(customOnsets.begin(),customOnsets.end(),a);
++              if (wi!=customOnsets.end()) wEnd=*wi;
++              int lenM=std::min(std::min(macroEnd,wEnd)-a,255);
++              for (int f=0; f<24 && lenM>1; f++) {
++                std::vector<int> seq;
++                bool changes=false;
++                for (int k=a; k<a+lenM; k++) {
++                  int v=(opllCust[(size_t)k*8+fmField[f][0]]>>fmField[f][1])&fmField[f][2];
++                  if (!seq.empty() && v!=seq[0]) changes=true;
++                  seq.push_back(v);
++                }
++                if (!changes) continue;
++                int lp=vgmCompress(seq);
++                ms.fmMac.push_back(std::make_pair(f,seq));
++                ms.fmMacLoop.push_back(lp);
++                ms.fmKey+=fmt::sprintf("f%d:%sL%d;",f,vgmMacroKey(seq),lp);
++              }
++            }
++          }
+           int relTick=-1;
+           if (adsr && adsrEnd<(int)vVol.size()) {
+             // attack | sustain sustain / fall: the loop (on the sustain) comes
+@@ -1877,8 +2144,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           ms.loop[4]=vNoise.empty()?-1:vgmCompress(vNoise);
+           ms.loop[5]=-1;
+           // a macro holds at most 255 ticks: if something still changes after
+-          // that, split the note at a row start and go on from there
+-          if (vVol.size()>255 || vDuty.size()>255 || vArp.size()>255 || vPitch.size()>255 || vNoise.size()>255) {
++          // that, split the note at a row start and go on from there.
++          if (vVol.size()>255 || vDuty.size()>255 || vArp.size()>255 || vPitch.size()>255 || vNoise.size()>255 || vEnv.size()>255) {
+             int limit=a+255;
+             int splitRow=rowOf(limit+shift);
+             int split=rowStart[splitRow]-shift;
+@@ -1886,12 +2153,15 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+             on.insert(on.begin()+i+1,split);
+             continue;
+           }
+-          bool volMacro=(vVol.size()>1) || adsr;
++          // (the OPLL drums always get one: Furnace doesn't set a drum's
++          // volume again on a new note, only when its volume macro runs)
++          bool volMacro=(vVol.size()>1) || adsr || (c>=21);
+           int noteVol=volMacro?15:vVol[0];
+           if (c==2 && !volMacro) noteVol=15;
+           ms.has[0]=volMacro;
+-          // the triangle and the SN squares have no duty/mode macro
+-          ms.has[1]=(c!=2 && !(isSN && c!=11));
++          // the triangle, the SN squares and FM have no duty/mode macro
++          // (FM: the patch number, the wave macro if it changes)
++          ms.has[1]=(c!=2 && !(isSN && c!=11) && !(isOPLL && c>=21));
+           ms.has[2]=!vgmAllZero(vArp);
+           ms.has[3]=!vgmAllZero(vPitch);
+           ms.has[4]=!vNoise.empty();
+@@ -1902,13 +2172,13 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           ms.v[3]=vPitch;
+           ms.v[4]=vNoise;
+           ms.v[5]=vEnv;
+-          String key=fmt::sprintf("%d|",ms.type);
++          String key=fmt::sprintf("%d|%s|%s|",ms.type,(ms.fm>=0)?fmSoundKeys[ms.fm]:String("-"),ms.fmKey);
+           for (int m=0; m<6; m++) {
+             key+=ms.has[m]?(vgmMacroKey(ms.v[m])+fmt::sprintf("L%dR%d;",ms.loop[m],ms.rel[m])):String("-;");
+           }
+           int setIndex=-1;
+           auto si=setMap.find(key);
+-          String nonVolKey=fmt::sprintf("%d|",ms.type);
++          String nonVolKey=fmt::sprintf("%d|%d|%s|",ms.type,ms.fm,ms.fmKey);
+           for (int m=1; m<6; m++) {
+             nonVolKey+=ms.has[m]?(vgmMacroKey(ms.v[m])+fmt::sprintf("L%d;",ms.loop[m])):String("-;");
+           }
+@@ -1936,7 +2206,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           // (-1: none), or -2 if it can't. the note only has to sound the same
+           // for as long as it is heard.
+           auto playsAs=[&](const VGMMacroSet& x) -> int {
+-            if (x.type!=ms.type) return -2;
++            if (x.type!=ms.type || x.fm!=ms.fm || x.fmKey!=ms.fmKey) return -2;
+             // the noise frequency is shared by the 3 channels: never add or drop it
+             if (x.has[4]!=ms.has[4] || x.has[5]!=ms.has[5] || x.has[1]!=ms.has[1]) return -2;
+             // a constant volume can't stand in for an envelope
+@@ -1970,7 +2240,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           // would every note of instrument y still sound the same (each with
+           // its own release, for as long as it is heard) with instrument x?
+           auto coversNotes=[&](const VGMMacroSet& x, const VGMMacroSet& y) -> bool {
+-            if (x.type!=y.type) return false;
++            if (x.type!=y.type || x.fm!=y.fm || x.fmKey!=y.fmKey) return false;
+             if (x.has[4]!=y.has[4] || x.has[5]!=y.has[5] || x.has[1]!=y.has[1] || x.has[0]!=y.has[0]) return false;
+             // a released note needs x to have a release point too
+             std::vector<int> ox, oy;
+@@ -2048,7 +2318,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+                   for (int k=0; k<span && ok; k++) {
+                     int mk=vgmMacroValueAt(cs.v[0],cs.loop[0],k);
+                     int ak=vgmMacroValueAt(ms.v[0],ms.loop[0],k);
+-                    int out=(is5B || isSN)?std::max(0,mk-(15-V)):((V*mk)/15);
++                    int out=(is5B || isSN || isOPLL)?std::max(0,mk-(15-V)):((V*mk)/15);
+                     if (out!=ak) ok=false;
+                   }
+                   if (ok) {
+@@ -2167,7 +2437,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       std::vector<bool> kept(sets.size(),false);
+       int keptCount=0;
+       // a channel type with no instrument at all keeps its most used shape
+-      for (int type: {0,2,3,4,5,6}) {
++      for (int type: {0,2,3,4,5,6,7,8}) {
+         bool any=false;
+         for (VGMMacroSet& ms: sets) if (ms.type==type && ms.ins>=0) any=true;
+         for (VGMMacroSet& ms: ctx.prevSets) if (ms.type==type) any=true;
+@@ -2194,7 +2464,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         long long best=-1;
+         VGMMacroSet* bestSet=NULL;
+         auto consider=[&](VGMMacroSet* cand) {
+-          if (cand->type!=sets[i].type) return;
++          if (cand->type!=sets[i].type || cand->fm!=sets[i].fm || cand->fmKey!=sets[i].fmKey) return;
+           long long d=dist(sets[i],*cand);
+           if (best<0 || d<best) {
+             best=d;
+@@ -2212,7 +2482,32 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+             keptCount++;
+             continue;
+           }
+-          if (!ctx.prevSets.empty()) bestSet=&ctx.prevSets[0];
++          // FM: nothing with this exact sound (patch registers, FM macros)
++          // left, so the closest instrument of the same kind
++          if (sets[i].type>=7) {
++            auto considerAny=[&](VGMMacroSet* cand) {
++              if (cand->type!=sets[i].type) return;
++              long long d=dist(sets[i],*cand);
++              // a different patch is a different sound
++              if (cand->fm!=sets[i].fm) d+=100000;
++              if (cand->fmKey!=sets[i].fmKey) d+=1000;
++              if (best<0 || d<best) {
++                best=d;
++                bestSet=cand;
++              }
++            };
++            for (size_t j=0; j<sets.size(); j++) {
++              if (kept[j] || sets[j].ins>=0) considerAny(&sets[j]);
++            }
++            for (VGMMacroSet& ps: ctx.prevSets) considerAny(&ps);
++          }
++          for (VGMMacroSet& ps: ctx.prevSets) {
++            if (bestSet!=NULL) break;
++            if (ps.type==sets[i].type) {
++              bestSet=&ps;
++              break;
++            }
++          }
+         }
+         if (bestSet!=NULL) {
+           target[i]=bestSet;
+@@ -2236,9 +2531,90 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       }
+       created[nr.set]=true;
+       DivInstrument* ins=new DivInstrument;
+-      ins->type=(ms.type==4)?DIV_INS_AY:((ms.type>=5)?DIV_INS_STD:DIV_INS_NES);
++      ins->type=(ms.type==4)?DIV_INS_AY:((ms.type>=7)?DIV_INS_OPLL:((ms.type>=5)?DIV_INS_STD:DIV_INS_NES));
+       String name;
+-      if (ms.type==5) {
++      if (ms.type>=7) {
++        const VGMFMSound& fs=fmSounds[ms.fm];
++        static const char* opllNames[16]={
++          "FM custom","Violin","Guitar","Piano","Flute","Clarinet","Oboe","Trumpet",
++          "Organ","Horn","Synth","Harpsichord","Vibraphone","Synth Bass","Wood Bass","Electric Guitar"
++        };
++        DivInstrumentFM& fm=ins->fm;
++        fm.ops=2;
++        const int patch=fs.drum?16:ms.v[1][0];
++        fm.opllPreset=patch;
++        // the channel's sustain bit
++        fm.alg=fs.sus?1:0;
++        fm.fb=0;
++        // the carrier "level" lowers the volume in Furnace: none here
++        fm.op[1].tl=0;
++        if (fs.drum) {
++          name="Drums";
++          fm.fixedDrums=false;
++        } else if (log.opllVRC7) {
++          name=(patch==0)?String("FM custom"):fmt::sprintf("VRC7 patch %d",patch);
++        } else {
++          name=opllNames[patch&15];
++        }
++        if (fs.inst==0) {
++          // the custom patch, register by register
++          const unsigned char* r=fs.cust;
++          for (int o=0; o<2; o++) {
++            DivInstrumentFM::Operator& op=fm.op[o];
++            op.am=(r[o]>>7)&1;
++            op.vib=(r[o]>>6)&1;
++            op.ssgEnv=(r[o]&0x20)?8:0;
++            op.egt=(r[o]>>5)&1;
++            op.ksr=(r[o]>>4)&1;
++            op.mult=r[o]&15;
++            op.ar=r[4+o]>>4;
++            op.dr=r[4+o]&15;
++            op.sl=r[6+o]>>4;
++            op.rr=r[6+o]&15;
++          }
++          fm.op[0].ksl=r[2]>>6;
++          fm.op[0].tl=r[2]&63;
++          fm.op[1].ksl=r[3]>>6;
++          fm.fms=(r[3]>>4)&1;
++          fm.ams=(r[3]>>3)&1;
++          fm.fb=r[3]&7;
++        }
++        if (fs.sus) name+=" sus";
++        for (size_t fi=0; fi<ms.fmMac.size(); fi++) {
++          int f=ms.fmMac[fi].first;
++          DivInstrumentMacro* mac=NULL;
++          if (f<10) {
++            DivInstrumentSTD::OpMacro& om=ins->std.opMacros[f/5];
++            DivInstrumentMacro* opm[5]={&om.amMacro,&om.vibMacro,&om.egtMacro,&om.ksrMacro,&om.multMacro};
++            mac=opm[f%5];
++          } else {
++            switch (f) {
++              case 10: mac=&ins->std.opMacros[0].tlMacro; break;
++              case 11: mac=&ins->std.opMacros[0].kslMacro; break;
++              case 12: mac=&ins->std.opMacros[1].kslMacro; break;
++              case 13: mac=&ins->std.fmsMacro; break;
++              case 14: mac=&ins->std.amsMacro; break;
++              case 15: mac=&ins->std.fbMacro; break;
++              default: {
++                // AR/DR (registers 4-5), SL/RR (6-7)
++                int r=f-16;
++                DivInstrumentSTD::OpMacro& om=ins->std.opMacros[(r>>1)&1];
++                if (r<4) {
++                  mac=(r&1)?&om.drMacro:&om.arMacro;
++                } else {
++                  mac=(r&1)?&om.rrMacro:&om.slMacro;
++                }
++                break;
++              }
++            }
++          }
++          const std::vector<int>& v=ms.fmMac[fi].second;
++          mac->len=v.size();
++          for (size_t k=0; k<v.size(); k++) mac->val[k]=v[k];
++          if (ms.fmMacLoop[fi]>=0) mac->loop=ms.fmMacLoop[fi];
++        }
++        if (!ms.fmMac.empty()) name+=" FM macro";
++      } else if (ms.type==5) {
+         name="PSG square";
+       } else if (ms.type==6) {
+         static const char* nModes[4]={"PSG noise periodic","PSG noise white","PSG noise periodic sq3","PSG noise white sq3"};
+@@ -2261,17 +2637,19 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       // on the 5B the mode goes to the wave macro, the noise frequency to the
+       // duty macro and the envelope shape to the ex2 macro
+       // on the SN76489 the duty macro is the noise mode and slot 4 holds
+-      // the Game Gear panning
++      // the Game Gear panning. on FM the patch number is the wave macro
+       DivInstrumentMacro* macros[6]={
+         &ins->std.volMacro,
+-        (ms.type==4)?&ins->std.waveMacro:&ins->std.dutyMacro,
++        (ms.type==4 || ms.type==7)?&ins->std.waveMacro:&ins->std.dutyMacro,
+         &ins->std.arpMacro,
+         &ins->std.pitchMacro,
+         (ms.type>=5)?&ins->std.panLMacro:&ins->std.dutyMacro,
+-        &ins->std.ex2Macro
++        (ms.type>=7)?&ins->std.phaseResetMacro:&ins->std.ex2Macro
+       };
+       for (int m=0; m<6; m++) {
+         if (!ms.has[m]) continue;
++        // FM: a patch that never changes is the instrument's own patch
++        if (m==1 && ms.type==7 && ms.v[1].size()<=1) continue;
+         DivInstrumentMacro* mac=macros[m];
+         if (ms.loop[m]>=0) mac->loop=ms.loop[m];
+         if (ms.rel[m]>=0) {
+@@ -2290,8 +2668,12 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+ 
+     // write the notes
+     {
+-      int colVol[12]={-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+-      int colFine[12]={0,0,0,0,0,0,0,0,0,0,0,0};
++      // what the volume column and E5xx are at, per song channel
++      int colVol[DIV_MAX_CHANS], colFine[DIV_MAX_CHANS];
++      for (int c=0; c<DIV_MAX_CHANS; c++) {
++        colVol[c]=-1;
++        colFine[c]=0;
++      }
+       for (VGMNoteRec& nr: recs) {
+         int c=nr.c;
+         VGMMacroSet& ms=*target[nr.set];
+@@ -2302,13 +2684,14 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         short* cell=cellAt(c,nr.rowA);
+         cell[DIV_PAT_NOTE]=nr.base;
+         cell[DIV_PAT_INS]=ms.ins;
+-        if (noteVol!=colVol[c]) {
++        const int pc=patIdx[c];
++        if (noteVol!=colVol[pc]) {
+           cell[DIV_PAT_VOL]=noteVol;
+-          colVol[c]=noteVol;
++          colVol[pc]=noteVol;
+         }
+-        if (nr.fine!=colFine[c]) {
++        if (nr.fine!=colFine[pc]) {
+           vgmPutFx(cell,0xe5,0x80+nr.fine,maxFxCol[c]);
+-          colFine[c]=nr.fine;
++          colFine[pc]=nr.fine;
+         }
+         // the envelope period is shared and notes are written channel by
+         // channel, so set it on every note that uses the envelope
+@@ -2341,6 +2724,24 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       warns.push_back(fmt::sprintf("this song has more note shapes than the 256 instrument limit: %d rare ones (%d notes) use the closest instrument instead, so they may sound slightly different",mergedSets,mergedNotes));
+     }
+ 
++    // YM2413 rhythm mode on and off: 18xx on the kick channel (Furnace's
++    // "OPLL with drums" starts with the drums on)
++    if (log.hasOPLL && log.opllDrums) {
++      bool cur=true;
++      int switches=0;
++      for (int k=0; k<numTicks; k++) {
++        if (opllRhythm[k]==cur) continue;
++        cur=opllRhythm[k];
++        int r=rowOf(k+shift);
++        if (r>=numRows) break;
++        vgmPutFx(cellAt(21,r),0x18,cur?1:0,maxFxCol[21]);
++        switches++;
++      }
++      if (loopRow>=0 && switches>0 && loopTick>=0 && loopTick<numTicks && opllRhythm[loopTick]!=cur) {
++        vgmPutFx(cellAt(21,loopRow),0x18,opllRhythm[loopTick]?1:0,maxFxCol[21]);
++      }
++    }
++
+     // --- step 12: loop or end ---
+     {
+       int lastRow=numRows-1;
+@@ -2356,9 +2757,14 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       }
+     }
+ 
+-    for (int c=0; c<12; c++) {
++    for (int c=0; c<NCH; c++) {
+       if (patIdx[c]<0) continue;
+-      sub->pat[patIdx[c]].effectCols=std::min(DIV_MAX_EFFECTS,std::max(1,maxFxCol[c]));
++      sub->pat[patIdx[c]].effectCols=1;
++    }
++    for (int c=0; c<NCH; c++) {
++      if (patIdx[c]<0) continue;
++      DivChannelData& cd=sub->pat[patIdx[c]];
++      cd.effectCols=std::min(DIV_MAX_EFFECTS,std::max((int)cd.effectCols,maxFxCol[c]));
+     }
+ 
+     logI("NES import: %d ticks at %.3f Hz, %d rows, %d instruments, %d samples",numTicks,44100.0/period,numRows,(int)ds.ins.size(),(int)ds.sample.size());
+@@ -2417,6 +2823,13 @@ bool DivEngine::loadVGM(unsigned char* file, size_t len) {
+     if (snFeedback==0) snFeedback=0x0009;
+     if (snWidth==0) snWidth=16;
+ 
++    // YM2413 (MSX-MUSIC, Master System FM...). bit 31 means a VRC7 (the
++    // Famicom's Konami expansion, an OPLL with its own patches)
++    unsigned int opllClockRaw=vgmRead32(b,0x10);
++    double opllClock=(double)(opllClockRaw&0x3fffffff);
++    bool opllVRC7=opllClockRaw&0x80000000;
++    bool dualOPLL=opllClockRaw&0x40000000;
++
+     // other chips: they are reported but not imported (yet)
+     static const struct {
+       size_t off;
+@@ -2441,8 +2854,9 @@ bool DivEngine::loadVGM(unsigned char* file, size_t len) {
+     String otherNames;
+     for (auto& oc: otherChips) {
+       if (version<oc.minVer) continue;
+-      // the chip being imported is not "other"
++      // the chips being imported are not "other"
+       if (oc.off==0x0c && nesClock<=0) continue;
++      if (oc.off==0x10) continue;
+       if (oc.off+4>dataStart && oc.off>=0x40) continue;
+       if ((vgmRead32(b,oc.off)&0x3fffffff)!=0) {
+         if (!otherNames.empty()) otherNames+=", ";
+@@ -2451,15 +2865,18 @@ bool DivEngine::loadVGM(unsigned char* file, size_t len) {
+     }
+ 
+     const bool useSN=(nesClock<=0 && snClock>0);
+-    if (nesClock<=0 && !useSN) {
++    const bool useOPLL=(opllClock>0);
++    if (nesClock<=0 && !useSN && !useOPLL) {
+       if (otherNames.empty()) {
+         lastError="this VGM has no sound chip that can be imported";
+       } else {
+-        lastError=fmt::sprintf("this VGM uses %s. only the NES APU (2A03) and the SN76489 can be imported for now",otherNames);
++        lastError=fmt::sprintf("this VGM uses %s. only the NES APU (2A03), the SN76489 and the YM2413/VRC7 can be imported for now",otherNames);
+       }
+       throw VGMInvalidException();
+     }
+-    bool pal=useSN?(headerRate==50):(nesClock<1700000.0);
++    bool pal=(nesClock>0)?(nesClock<1700000.0):(headerRate==50);
++    bool opllRhythm=false;
++    int opllWrites2=0;
+     bool snStereo=false;
+     int snWrites2=0;
+ 
+@@ -2541,6 +2958,19 @@ bool DivEngine::loadVGM(unsigned char* file, size_t len) {
+             pos++;
+           } else if (cmd>=0x30 && cmd<=0x3f) {
+             pos+=2;
++          } else if (cmd==0x51) {
++            if (pos+2<b.size() && useOPLL) {
++              VGMEvent e;
++              e.time=now;
++              e.reg=0x300|b[pos+1];
++              e.val=b[pos+2];
++              if (b[pos+1]==0x0e && (e.val&0x20)) opllRhythm=true;
++              events.push_back(e);
++            }
++            pos+=3;
++          } else if (cmd==0xa1) {
++            opllWrites2++;
++            pos+=3;
+           } else if (cmd==0x4f || cmd==0x50) {
+             if (useSN && pos+1<b.size()) {
+               VGMEvent e;
+@@ -2590,9 +3020,15 @@ bool DivEngine::loadVGM(unsigned char* file, size_t len) {
+     // --- step 2: turn the log into a song ---
+     DivSong ds;
+     ds.version=DIV_VERSION_VGM;
+-    ds.systemLen=1;
++    ds.systemLen=0;
++    if (nesClock>0) {
++      ds.system[0]=DIV_SYSTEM_NES;
++      ds.systemFlags[0].set("clockSel",pal?1:0);
++      ds.systemLen=1;
++    }
+     if (useSN) {
+       ds.system[0]=DIV_SYSTEM_SMS;
++      ds.systemLen=1;
+       // Game Gear when the file uses its stereo, otherwise the Sega PSG
+       // (or a TI one, by its noise feedback)
+       int chipType=0;
+@@ -2616,16 +3052,38 @@ bool DivEngine::loadVGM(unsigned char* file, size_t len) {
+       }
+       ds.systemFlags[0].set("clockSel",bestSel);
+       snClock=clocks[bestSel];
+-    } else {
+-      ds.system[0]=DIV_SYSTEM_NES;
+-      ds.systemFlags[0].set("clockSel",pal?1:0);
+     }
+-    ds.systemVol[0]=1.0f;
+-    ds.systemPan[0]=0.0f;
++    // the YM2413 after the other chip (song commands stay in the first channel)
++    const bool opllDrums=opllRhythm && !opllVRC7;
++    if (useOPLL) {
++      int si=ds.systemLen;
++      ds.system[si]=opllVRC7?DIV_SYSTEM_VRC7:(opllDrums?DIV_SYSTEM_OPLL_DRUMS:DIV_SYSTEM_OPLL);
++      static const double clocks[4]={315000000.0/88.0,(283.75*15625.0+25.0)*4.0/5.0,4000000.0,(315000000.0/88.0)/2.0};
++      int bestSel=0;
++      double bestD=1e30;
++      for (int i=0; i<4; i++) {
++        double d=fabs(clocks[i]-opllClock);
++        if (d<bestD) {
++          bestD=d;
++          bestSel=i;
++        }
++      }
++      ds.systemFlags[si].set("clockSel",bestSel);
++      opllClock=clocks[bestSel];
++      ds.systemLen++;
++    }
++    for (int i=0; i<ds.systemLen; i++) {
++      ds.systemVol[i]=1.0f;
++      ds.systemPan[i]=0.0f;
++    }
+     ds.initDefaultSystemChans();
+     VGMNESLog log;
+-    log.hasNES=!useSN;
++    log.hasNES=(nesClock>0);
+     log.hasSN=useSN;
++    log.hasOPLL=useOPLL;
++    log.opllVRC7=opllVRC7;
++    log.opllDrums=opllDrums;
++    log.opllClock=opllClock;
+     log.snStereo=snStereo;
+     log.snClock=snClock;
+     // the TI chips run the noise at clock/60 in Furnace
+@@ -2680,6 +3138,7 @@ bool DivEngine::loadVGM(unsigned char* file, size_t len) {
+     if (instrumentsOver>0) addWarning(fmt::sprintf("%d DPCM/PCM hits needed more than 256 instruments and were left out",instrumentsOver));
+     if (useSN && (dualSN || snWrites2>0)) addWarning("this VGM has a second SN76489; only the first one was imported");
+     if (useSN && t6w28) addWarning("this VGM uses the T6W28 (Neo Geo Pocket); it was imported as a Game Gear PSG");
++    if (useOPLL && (dualOPLL || opllWrites2>0)) addWarning("this VGM has a second YM2413; only the first one was imported");
+     if (hasFDS || fdsWrites>0) addWarning("this VGM uses the Famicom Disk System sound; FDS import is not supported yet, so that part is missing");
+     if (dualNES || nes2Writes>0) addWarning("this VGM has a second NES APU; only the first one was imported");
+     if (!otherNames.empty() || otherWrites>0) addWarning(fmt::sprintf("this VGM also uses %s, which was not imported",otherNames.empty()?String("other chips"):otherNames));
+-- 
+2.43.0
+

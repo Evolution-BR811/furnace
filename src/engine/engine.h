@@ -76,6 +76,8 @@ class DivWorkPool;
 #define DIV_VERSION_XM 0xff06
 #define DIV_VERSION_IT 0xff07
 #define DIV_VERSION_MIDI 0xff08
+#define DIV_VERSION_VGM 0xff09
+#define DIV_VERSION_NSF 0xff0a
 
 /**
  * used by the -view flag in command line player.
@@ -445,6 +447,17 @@ struct DivNoteEvent {
  * a DivDispatchContainer handles the audio output portion of a dispatch.
  * it performs resampling as the engine's audio output rate usually differs from that of dispatches.
  */
+// curva de volume medida de um canal (volumeAdapt.cpp)
+struct DivVolumeCurve {
+  int maxVol;
+  bool ok;
+  // nivel RMS no volume maximo
+  double maxLevel;
+  // nivel de cada volume em dB, relativo ao volume maximo
+  std::vector<double> db;
+  DivVolumeCurve(): maxVol(0), ok(false), maxLevel(0.0) {}
+};
+
 struct DivDispatchContainer {
   // the dispatch.
   DivDispatch* dispatch;
@@ -579,6 +592,33 @@ struct DivEffectContainer {
     memset(in,0,DIV_MAX_OUTPUTS*sizeof(float*));
     memset(out,0,DIV_MAX_OUTPUTS*sizeof(float*));
   }
+};
+
+/**
+ * options for NSF import.
+ */
+struct DivNSFImportOptions {
+  // tracks to import (1-based). empty: the NSF's starting track.
+  std::vector<int> tracks;
+  // how long a track may play while looking for its loop
+  int maxSeconds;
+  DivNSFImportOptions():
+    maxSeconds(300) {}
+};
+
+/**
+ * what an NSF file contains (for the track picker).
+ */
+struct DivNSFInfo {
+  String title, artist, copyright, chips;
+  int songs, start;
+  bool pal;
+  std::vector<String> trackNames;
+  std::vector<int> trackLengths;
+  DivNSFInfo():
+    songs(0),
+    start(1),
+    pal(false) {}
 };
 
 /**
@@ -1093,6 +1133,11 @@ class DivEngine {
   bool loadTFMv1(unsigned char* file, size_t len);
   bool loadTFMv2(unsigned char* file, size_t len);
   bool loadMIDI(unsigned char* file, size_t len);
+  bool loadVGM(unsigned char* file, size_t len);
+  bool loadNSF(unsigned char* file, size_t len);
+  bool loadSID(unsigned char* file, size_t len);
+  bool loadSPC(unsigned char* file, size_t len);
+  bool loadGBS(unsigned char* file, size_t len);
 
   /**
    * these functions load various instrument formats.
@@ -1308,6 +1353,7 @@ class DivEngine {
     // MIDI import options.
     // the GUI checks whether the loaded file is a MIDI file and prompts options before actually loading.
     DivMIDIImportOptions midiImportOptions;
+    DivNSFImportOptions nsfImportOptions;
 
     /**
      * this function should not be called directly. it is used by saveAudio().
@@ -1468,6 +1514,12 @@ class DivEngine {
     DivROMExport* buildROM(DivROMExportOptions sys);
     // compile instruments.
     SafeWriter* compileAllIns(int insType);
+    /**
+     * read the header of an NSF/NSFe file (for the NSF import dialog).
+     * @return whether the file is a valid NSF.
+     */
+    bool getNSFInfo(const unsigned char* file, size_t len, DivNSFInfo& info);
+
     /**
      * export to VGM (register dump format).
      * @param sysToExport an array specifying which chips to export. if NULL, all chips supported by the VGM format will be exported.
@@ -2106,6 +2158,11 @@ class DivEngine {
 
     // change system
     bool changeSystem(int index, DivSystem which, bool preserveOrder=true);
+    // adaptacao automatica de volume na troca de chip (volumeAdapt.cpp)
+    // mede a curva de volume de um chip tocando uma nota em cada volume, num chip escondido
+    bool calibrateVolumeCurve(DivSystem sys, const DivConfig& flags, int chans, std::vector<DivVolumeCurve>& curves);
+    // troca o chip e adapta coluna de volume, macros de volume e mixagem ao chip novo
+    bool changeSystemAdaptVolume(int index, DivSystem which, bool preserveOrder, String& report);
 
     // set system channel count
     bool setSystemChans(int index, int ch, bool preserveOrder=true);

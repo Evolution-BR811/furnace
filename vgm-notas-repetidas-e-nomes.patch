@@ -1,0 +1,277 @@
+From f567402888f2fbdb4f045a638b6b935eecccaef8 Mon Sep 17 00:00:00 2001
+From: Evolution BR811 <344454957+Evolution-BR811@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 20:06:59 -0400
+Subject: [PATCH] VGM/NSF import: repeated notes, channel names on instruments
+
+- a note played again (only the envelope starts over, like Furnace and
+  many drivers do when the pitch doesn't change) becomes its own note
+  when it lands on a row start, so two channels playing the same short
+  phrase share one instrument instead of one long phrase-instrument each.
+  the notes are built with and without these, keeping whichever needs
+  fewer instruments
+- 04xy vibrato also on top of a 00xy chord arpeggio
+- instrument names end with the channels that use them, e.g. [P1, P2]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KMJUrc1fn7dir5w2PfSPK2
+---
+ src/engine/fileOps/vgm.cpp | 165 +++++++++++++++++++++++++++++++------
+ 1 file changed, 141 insertions(+), 24 deletions(-)
+
+diff --git a/src/engine/fileOps/vgm.cpp b/src/engine/fileOps/vgm.cpp
+index c447436..34d02b4 100644
+--- a/src/engine/fileOps/vgm.cpp
++++ b/src/engine/fileOps/vgm.cpp
+@@ -683,6 +683,8 @@ struct VGMNESContext {
+   std::vector<VGMMacroSet> prevSets;
+   // most new instruments one subsong may make (0: no limit)
+   int shareLimit=0;
++  // the channels each instrument plays on (for its name)
++  std::map<int,std::vector<String>> insChans;
+ };
+ 
+ // turns an APU log into notes, instruments and effects in one subsong
+@@ -1381,6 +1383,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+ 
+     // --- step 6: note onsets (first pass) ---
+     std::vector<int> onsets[NCH];
++    // repeated notes (see below): only taken if they land on a row start
++    std::vector<int> repeatCand[NCH];
+     for (int c: tonal) {
+       std::vector<VGMChanTick>& ct=chanTicks[c];
+       for (int k=0; k<numTicks; k++) {
+@@ -1408,6 +1412,31 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           onsets[c].push_back(k);
+           continue;
+         }
++        // the same note again: Furnace (and many drivers) don't rewrite the
++        // period for a repeated note, only the envelope starts over. if the
++        // volume goes up and the next ticks (volume, duty, noise) are the
++        // start of the current note again, it may be a new note (step 8 keeps
++        // it if it falls on a row start, like a note in a tracker would;
++        // envelopes that loop by themselves rarely do)
++        if (volUp && !onsets[c].empty()) {
++          int o=onsets[c].back();
++          int L=std::min(4,k-o);
++          if (L>=2) {
++            bool same=true;
++            int checked=0;
++            for (int i=0; i<L && same; i++) {
++              if (k+i>=numTicks || !ct[k+i].aud) break;
++              const VGMChanTick& x=ct[o+i];
++              const VGMChanTick& y=ct[k+i];
++              if (x.vol!=y.vol || x.duty!=y.duty || x.noise!=y.noise) same=false;
++              checked++;
++            }
++            if (same && checked>=std::min(L,3)) {
++              repeatCand[c].push_back(k);
++              continue;
++            }
++          }
++        }
+       }
+     }
+     // a "note" one tick after another one on the same channel is almost always
+@@ -1542,6 +1571,9 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     int numRows=(int)rowLen.size();
+ 
+     // --- step 8: pitch changes on row starts are new notes too (legato) ---
++    // (onsetsRep also has the repeated notes: the notes are built with and
++    // without them, and the song keeps whichever needs fewer instruments)
++    std::vector<int> onsetsRep[NCH];
+     for (int c: tonal) {
+       std::vector<VGMChanTick>& ct=chanTicks[c];
+       std::vector<int> extra;
+@@ -1567,19 +1599,46 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+         }
+         if (stable) extra.push_back(k);
+       }
+-      onsets[c].insert(onsets[c].end(),extra.begin(),extra.end());
+-      std::sort(onsets[c].begin(),onsets[c].end());
+-      onsets[c].erase(std::unique(onsets[c].begin(),onsets[c].end()),onsets[c].end());
+-      // one note per row: later notes in the same row melt into the first one
+-      std::vector<int> kept;
+-      int lastRow=-1;
+-      for (int k: onsets[c]) {
++      // (and only when it starts like the note before it, or holds its
++      // first note for a moment: a driver that plays its attack on another
++      // pitch is one long note with its own shape)
++      std::vector<int> extraRep;
++      for (int k: repeatCand[c]) {
+         int r=rowOf(k+shift);
+-        if (r==lastRow) continue;
+-        kept.push_back(k);
+-        lastRow=r;
++        if (r<0 || r>=numRows || rowStart[r]!=k+shift) continue;
++        auto po=std::upper_bound(onsets[c].begin(),onsets[c].end(),k);
++        int o=(po==onsets[c].begin())?-1:*(po-1);
++        // the pitch moves like it did at the start of the note before
++        // (the same note, or an arpeggio played again from another root)
++        bool sameShape=(o>=0);
++        for (int i=1; i<3 && sameShape; i++) {
++          if (k+i>=numTicks || o+i>=k || !ct[k+i].aud) break;
++          if (tickNote(c,ct[k+i])-tickNote(c,ct[k])!=tickNote(c,ct[o+i])-tickNote(c,ct[o])) sameShape=false;
++        }
++        bool steady=(k+1>=numTicks || !ct[k+1].aud || tickNote(c,ct[k+1])==tickNote(c,ct[k]));
++        if (!sameShape && !steady) continue;
++        extraRep.push_back(k);
+       }
+-      onsets[c]=kept;
++      // one note per row: later notes in the same row melt into the first one
++      auto finish=[&](std::vector<int> v) -> std::vector<int> {
++        std::sort(v.begin(),v.end());
++        v.erase(std::unique(v.begin(),v.end()),v.end());
++        std::vector<int> kept;
++        int lastRow=-1;
++        for (int k: v) {
++          int r=rowOf(k+shift);
++          if (r==lastRow) continue;
++          kept.push_back(k);
++          lastRow=r;
++        }
++        return kept;
++      };
++      std::vector<int> base=onsets[c];
++      base.insert(base.end(),extra.begin(),extra.end());
++      std::vector<int> withRep=base;
++      withRep.insert(withRep.end(),extraRep.begin(),extraRep.end());
++      onsets[c]=finish(base);
++      onsetsRep[c]=finish(withRep);
+     }
+ 
+     // --- step 9: build the song ---
+@@ -2027,9 +2086,13 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     // a lot, but can split music whose volume only decays)
+     std::vector<VGMMacroSet> setsAlt;
+     std::vector<VGMNoteRec> recsAlt;
+-    int scaledAlt=0, prefixAlt=0;
+-    for (int pass=0; pass<2; pass++) {
+-      const bool allowADSR=(pass==0);
++    int scaledAlt=0, prefixAlt=0, passAlt=-1;
++    bool anyRepeat=false;
++    for (int c: tonal) if (onsetsRep[c]!=onsets[c]) anyRepeat=true;
++    for (int pass=0; pass<4; pass++) {
++      const bool allowADSR=!(pass&1);
++      const bool useRep=(pass&2);
++      if (useRep && !anyRepeat) break;
+       sets.clear();
+       setMap.clear();
+       recs.clear();
+@@ -2038,7 +2101,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       prefixMatches=0;
+       for (int c: tonal) {
+         std::vector<VGMChanTick>& ct=chanTicks[c];
+-        std::vector<int>& on=onsets[c];
++        std::vector<int>& on=useRep?onsetsRep[c]:onsets[c];
+         const bool is5B=(c>=5 && c<8);
+         const bool isSN=(c>=8 && c<12);
+         const bool isOPLL=(c>=12);
+@@ -2395,7 +2458,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+           // Furnace) goes to the pattern instead of a pitch macro: try every
+           // speed and depth, from the note's start or from a row start
+           int vibRow=-1, vibVal=0;
+-          if (c!=3 && c!=11 && c!=4 && c<21 && legato.empty() && arpFx.empty() && vgmAllZero(vArp) && !vgmAllZero(vPitch) && macroEnd-a>=4) {
++          // (also on top of a chord arpeggio, 00xy + 04xy)
++          if (c!=3 && c!=11 && c!=4 && c<21 && legato.empty() && vgmAllZero(vArp) && !vgmAllZero(vPitch) && macroEnd-a>=4) {
+             static short vibT[64];
+             static bool vibInit=false;
+             if (!vibInit) {
+@@ -2434,7 +2498,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+                         int pos=((j-kv+1)*rate)&63;
+                         vib=((depth*vibT[pos]*15)>>4)/15;
+                       }
+-                      if (periodAt(c,(base<<7)+fines[fi]+vib)!=ct[a+j].period) ok=false;
++                      if (periodAt(c,((base+arpAdd[j])<<7)+fines[fi]+vib)!=ct[a+j].period) ok=false;
+                     }
+                     if (ok) {
+                       found=true;
+@@ -2760,19 +2824,24 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+       }
+ 
+ 
+-      if (pass==0) {
++      // keep the best so far in setsAlt
++      if (passAlt<0 || sets.size()<setsAlt.size()) {
+         setsAlt.swap(sets);
+         recsAlt.swap(recs);
+         scaledAlt=scaledMatches;
+         prefixAlt=prefixMatches;
+-      } else if (setsAlt.size()<sets.size()) {
+-        sets.swap(setsAlt);
+-        recs.swap(recsAlt);
+-        scaledMatches=scaledAlt;
+-        prefixMatches=prefixAlt;
+-        logI("VGM import: envelopes with release: %d instruments instead of %d",(int)sets.size(),(int)setsAlt.size());
++        passAlt=pass;
+       }
+     }
++    sets.swap(setsAlt);
++    recs.swap(recsAlt);
++    scaledMatches=scaledAlt;
++    prefixMatches=prefixAlt;
++    if (!(passAlt&1)) logI("VGM import: using envelopes with release");
++    if (passAlt&2) {
++      logI("VGM import: using repeated notes");
++      for (int c: tonal) onsets[c]=onsetsRep[c];
++    }
+ 
+     // --- the whole song at once: an instrument that is only a cut short or
+     // quieter version of another one goes away. (while the notes were being
+@@ -3388,6 +3457,54 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong*
+     for (size_t i=0; i<sets.size(); i++) {
+       if (created[i]) ctx.prevSets.push_back(sets[i]);
+     }
++    // the instrument names say which channels use them, like "Pulse 3 [P1, P2]"
++    {
++      static const char* chanName[NCH]={
++        "P1","P2","TRI","NOI","DMC","5B-A","5B-B","5B-C","SQ1","SQ2","SQ3","NOI",
++        "FM1","FM2","FM3","FM4","FM5","FM6","FM7","FM8","FM9",
++        "BD","SD","TOM","TOP","HH"
++      };
++      std::map<int,String> pcName;
++      for (int c=0; c<NCH; c++) {
++        if (patIdx[c]<0) continue;
++        auto it=pcName.find(patIdx[c]);
++        if (it==pcName.end()) {
++          pcName[patIdx[c]]=chanName[c];
++        } else {
++          it->second+=String("/")+chanName[c];
++        }
++      }
++      std::set<int> touched;
++      for (int pc=0; pc<numChans; pc++) {
++        if (!pcName.count(pc)) continue;
++        std::set<int> used;
++        for (int o=0; o<sub->ordersLen; o++) {
++          DivPattern* pat=sub->pat[pc].getPattern(sub->orders.ord[pc][o],false);
++          if (pat==NULL) continue;
++          for (int r=0; r<sub->patLen; r++) {
++            int in=pat->newData[r][DIV_PAT_INS];
++            if (in>=0 && in<(int)ds.ins.size()) used.insert(in);
++          }
++        }
++        for (int in: used) {
++          std::vector<String>& v=ctx.insChans[in];
++          if (std::find(v.begin(),v.end(),pcName[pc])==v.end()) v.push_back(pcName[pc]);
++          touched.insert(in);
++        }
++      }
++      for (int in: touched) {
++        String& nm=ds.ins[in]->name;
++        size_t br=nm.find(" [");
++        if (br!=String::npos) nm=nm.substr(0,br);
++        nm+=" [";
++        const std::vector<String>& v=ctx.insChans[in];
++        for (size_t i=0; i<v.size(); i++) {
++          if (i>0) nm+=", ";
++          nm+=v[i];
++        }
++        nm+="]";
++      }
++    }
+     logI("VGM import: %d note shapes, %d merged (%d notes), %d scaled matches, %d prefix matches",(int)sets.size(),mergedSets,mergedNotes,scaledMatches,prefixMatches);
+     if (mergedSets>0) {
+       warns.push_back(fmt::sprintf("this song has more note shapes than the 256 instrument limit: %d rare ones (%d notes) use the closest instrument instead, so they may sound slightly different",mergedSets,mergedNotes));
+-- 
+2.43.0
+

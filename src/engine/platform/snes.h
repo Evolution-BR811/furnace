@@ -75,6 +75,9 @@ class DivPlatformSNES: public DivDispatch {
   bool initEchoOn;
   signed char initEchoVolL;
   signed char initEchoVolR;
+  // the main (dry) volume at the start (MVOL), like the echo's
+  signed char initDryVolL;
+  signed char initDryVolR;
   signed char initEchoFeedback;
   signed char initEchoFIR[8];
   unsigned char initEchoDelay;

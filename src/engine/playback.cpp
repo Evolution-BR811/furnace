@@ -789,7 +789,16 @@ void DivEngine::processRow(int i, bool afterDelay) {
 
   // note reading
   // note offs are sent immediately
-  if (pat->newData[whatRow][DIV_PAT_NOTE]==DIV_NOTE_OFF) { // note off
+  // on sample channels "===" (note release) cuts the note like OFF: a sample
+  // has no envelope to release, and MIDI imports (OpenMPT) write "===" for
+  // every note off
+  // (a channel playing a sample instrument counts too, e.g. a DAC/PCM mode)
+  bool relIsOff=false;
+  if (pat->newData[whatRow][DIV_PAT_NOTE]==DIV_NOTE_REL) {
+    if (getChannelType(i)==DIV_CH_PCM) relIsOff=true;
+    if (chan[i].lastIns>=0 && chan[i].lastIns<(int)song.ins.size() && song.ins[chan[i].lastIns]->type==DIV_INS_AMIGA) relIsOff=true;
+  }
+  if (pat->newData[whatRow][DIV_PAT_NOTE]==DIV_NOTE_OFF || relIsOff) { // note off
     chan[i].keyOn=false;
     chan[i].keyOff=true;
 
@@ -2092,6 +2101,9 @@ void DivEngine::nextRow() {
 // if inhibitLowLat is on, low-latency mode is not taken into account. this is used by the export functions.
 // returns whether the song has ended.
 bool DivEngine::nextTick(bool noAccum, bool inhibitLowLat) {
+  // linearidade parcial (legado): as tabelas de pitch dos chips leem estes valores
+  DivPitchTable::legacyPartial=(song.compatFlags.partialPitch && !song.compatFlags.linearPitch);
+  DivPitchTable::legacyPitchMacroLinear=song.compatFlags.pitchMacroIsLinear;
   bool ret=false;
   // prevent a division by zero
   if (divider<1) divider=1;

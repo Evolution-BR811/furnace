@@ -146,6 +146,7 @@ void FurnaceGUI::insTabSample(DivInstrument* ins) {
         ins->type==DIV_INS_NDS ||
         ins->type==DIV_INS_SUPERVISION ||
         ins->type==DIV_INS_BR811 ||
+        ins->type==DIV_INS_BR1611 ||
         ins->type==DIV_INS_SID3) {
       P(ImGui::Checkbox(_("Use sample"),&ins->amiga.useSample));
       if (ins->type==DIV_INS_X1_010) {
@@ -170,6 +171,10 @@ void FurnaceGUI::insTabSample(DivInstrument* ins) {
         }
       }
       ImGui::EndCombo();
+    }
+    // BR1611: envelope proprio do PCM (canais 6 e 7)
+    if (ins->type==DIV_INS_BR1611 && ins->amiga.useSample) {
+      insEditBR1611PCMEnv(ins);
     }
     // Wavetable
     if (ins->type==DIV_INS_AMIGA || ins->type==DIV_INS_SNES || ins->type==DIV_INS_GBA_DMA || ins->type==DIV_INS_GBA_MINMOD) {

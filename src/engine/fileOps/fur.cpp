@@ -2431,11 +2431,14 @@ bool DivEngine::loadFur(unsigned char* file, size_t len, int variantID) {
       }
     }
 
-    // warn on partial pitch linearity
+    // partial pitch linearity
+    // o Furnace oficial converte para linear completo, o que muda o tamanho dos slides 01xx/02xx.
+    // este fork mantem o comportamento antigo: linearidade parcial (legado).
     if (ds.compatFlags.linearPitch>1) {
       ds.compatFlags.linearPitch=1;
     } else if (ds.version<237 && ds.compatFlags.linearPitch!=0) {
-      addWarning("this song used partial pitch linearity, which has been removed from Furnace. you may have to adjust your song.");
+      ds.compatFlags.linearPitch=0;
+      ds.compatFlags.partialPitch=true;
     }
     ds.recalcChans();
 
