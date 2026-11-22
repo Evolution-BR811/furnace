@@ -40,8 +40,10 @@ void DivPlatformPWM32X::acquire(short** buf, size_t len) {
     oscBuf[i].begin(len);
   }
 
-  // the PWM's range: 0 to the cycle register, silence in the middle
-  const double half=(double)cycle*0.5;
+  // the pulse's length in clocks (cycle-1): the widest pulse, and silence
+  // is half of it (the mixer's zero)
+  const int clocks=cycle-1;
+  const double half=(double)clocks*0.5;
 
   for (size_t h=0; h<len; h++) {
     int mixL=0, mixR=0;
@@ -102,24 +104,35 @@ void DivPlatformPWM32X::acquire(short** buf, size_t len) {
       mixR+=(output*ch.panR)/255;
     }
 
-    // the sum goes to the PWM: a whole number of clocks in its range
-    // (clipped at its ends), which is what is heard
+    // the sum goes to the PWM as whole pulse widths, as the driver writes
+    // them (a width can't go past a full pulse: it is high all the time)
     int pwmL=(int)round(half+(double)mixL*half/32767.0);
     int pwmR=(int)round(half+(double)mixR*half/32767.0);
     if (pwmL<0) pwmL=0;
-    if (pwmL>cycle) pwmL=cycle;
+    if (pwmL>clocks) pwmL=clocks;
     if (pwmR<0) pwmR=0;
-    if (pwmR>cycle) pwmR=cycle;
+    if (pwmR>clocks) pwmR=clocks;
     lastL=pwmL;
     lastR=pwmR;
-    double outL=((double)pwmL-half)*32767.0/half;
-    double outR=((double)pwmR-half)*32767.0/half;
-    if (outL<-32768.0) outL=-32768.0;
-    if (outL>32767.0) outL=32767.0;
-    if (outR<-32768.0) outR=-32768.0;
-    if (outR>32767.0) outR=32767.0;
-    buf[0][h]=(short)outL;
-    buf[1][h]=(short)outR;
+    // the outputs, by LMD/RMD: the level is the pulse's width over its
+    // length (0 to 1; times 2 here, so the whole range is 32767 each way)
+    double in[2];
+    for (int o=0; o<2; o++) {
+      const int mode=o?rmode:lmode;
+      int w=0;
+      if (mode==1) w=o?pwmR:pwmL;
+      else if (mode==2) w=o?pwmL:pwmR;
+      in[o]=2.0*(double)w/(double)clocks;
+    }
+    // the board's DC removal: what is heard is the change around the middle
+    for (int o=0; o<2; o++) {
+      dcOut[o]=0.999*dcOut[o]+in[o]-dcIn[o];
+      dcIn[o]=in[o];
+      double v=dcOut[o]*32767.0;
+      if (v<-32768.0) v=-32768.0;
+      if (v>32767.0) v=32767.0;
+      buf[o][h]=(short)v;
+    }
   }
 
   for (int i=0; i<chans; i++) {
@@ -350,7 +363,14 @@ void DivPlatformPWM32X::reset() {
     chan[i].pitchTable=samplePitchTable.get(-1);
     chan[i].std.setEngine(parent);
   }
-  lastL=lastR=cycle/2;
+  lastL=lastR=(cycle-1)/2;
+  // (the filter starts settled on silence: the click of the outputs coming
+  // up to the middle happens when the console is turned on, not per song)
+  for (int o=0; o<2; o++) {
+    const int mode=o?rmode:lmode;
+    dcIn[o]=(mode==1 || mode==2)?2.0*(double)((cycle-1)/2)/(double)(cycle-1):0.0;
+    dcOut[o]=0.0;
+  }
 }
 
 int DivPlatformPWM32X::getOutputCount() {
@@ -408,9 +428,13 @@ void DivPlatformPWM32X::setFlags(const DivConfig& flags) {
   if (clockSel<0 || clockSel>1) clockSel=0;
   chipClock=pwmClocks[clockSel];
   // the cycle register: a PWM output every cycle-1 clocks
+  // (0 is 4096 in 12 bits; 1 stops the PWM on the real one. very short
+  // cycles would run the chip at hundreds of kHz: 128 is the shortest here)
   cycle=flags.getInt("cycle",1047);
-  if (cycle<256) cycle=256;
+  if (cycle<128) cycle=128;
   if (cycle>4095) cycle=4095;
+  lmode=flags.getInt("lmode",1)&3;
+  rmode=flags.getInt("rmode",1)&3;
   rate=(int)round((double)chipClock/(double)(cycle-1));
   if (rate<1000) rate=1000;
   for (int i=0; i<chans; i++) {

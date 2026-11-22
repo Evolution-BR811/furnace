@@ -2455,7 +2455,7 @@ void DivEngine::registerSystems() {
   sysDefs[DIV_SYSTEM_PWM_32X]=new DivSysDef(
     _("Sega 32X PWM"), NULL, 0x32a, 0, 8, 1, 16,
     false, true, 0, false, (1U<<DIV_SAMPLE_DEPTH_16BIT)|(1U<<DIV_SAMPLE_DEPTH_8BIT), 0, 0,
-    _("the sound of the Sega 32X: two pulse width DACs (left and right), with a rate and a resolution set by the cycle register (22 kHz and about 10 bits at its usual value). it has no channels of its own: games mixed them on its SH2 processor, which is what these channels do (samples without interpolation, a volume and panning each, summed and clipped to the PWM's range)."),
+    _("the sound of the Sega 32X: two pulse width outputs (left and right), with a rate and a resolution set by the cycle register (22 kHz and about 10 bits at its usual value), its output modes (each side can play its own channel, the other one or nothing) and the board's DC removal. it has no channels of its own: games mixed them on its SH2 processor, which is what these channels do (samples without interpolation, a volume and panning each, summed into whole pulse widths)."),
     DivChanDefFunc(stockChanDef<DIV_CH_PCM,DIV_INS_AMIGA>)
   );
 

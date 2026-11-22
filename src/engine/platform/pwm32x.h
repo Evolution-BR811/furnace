@@ -22,13 +22,21 @@
 
 #include "../dispatch.h"
 
-// the Sega 32X's PWM: two pulse width DACs (left and right) that output one
-// value every (cycle-1) clocks of the 32X's SH2 clock, from 0 to the cycle
-// register (the middle is silence). the 32X has no sound channels: its SH2
-// mixes them in software and writes the sum to the PWM. the channels here are
-// that mixer, done like the drivers did it: samples stepped at the PWM's rate
-// without interpolation, a volume and a left/right level each, summed and
-// clipped to the PWM's range
+// the Sega 32X's PWM, as the hardware does it (after ares and PicoDrive):
+// - two pulse width outputs, left and right, that take a value every cycle-1
+//   clocks of the SH2's clock (the cycle register, 12 bits)
+// - the value is the pulse's width in those clocks: the level is
+//   width/(cycle-1), clipped at a full pulse (100%)
+// - the control register's LMD/RMD: each output plays its own channel, the
+//   other one, or nothing
+// - the output goes through the board's DC removal (a one-pole high-pass,
+//   0.999 per output, as in ares), so only changes are heard
+// the 32X has no sound channels: its SH2 mixes them in software and writes
+// the sum to the PWM. the channels here are that mixer, done like the
+// drivers did it: samples stepped at the PWM's rate without interpolation, a
+// volume and a left/right level each, summed into whole pulse widths
+// (the PWM's FIFO and timer interrupt are how the SH2 keeps it fed: a mixer
+// that writes every output never lets it run dry, so they aren't heard)
 class DivPlatformPWM32X: public DivDispatch {
   struct Channel: public SharedChannel {
     bool audDir;
@@ -54,9 +62,14 @@ class DivPlatformPWM32X: public DivDispatch {
   int chans;
   DivDispatchOscBuffer* oscBuf;
   DivPitchTableManager samplePitchTable;
-  // the cycle register (12 bits) and what the outputs last held
+  // the cycle register (12 bits), the output modes (LMD/RMD: 0 off, 1 own
+  // channel, 2 the other channel, 3 not allowed: off) and what the outputs
+  // last held
   int cycle;
+  int lmode, rmode;
   int lastL, lastR;
+  // the DC removal's state per output (last input, output)
+  double dcIn[2], dcOut[2];
 
   friend void putDispatchChip(void*,int);
   friend void putDispatchChan(void*,int,int);
@@ -83,7 +96,7 @@ class DivPlatformPWM32X: public DivDispatch {
     int init(DivEngine* parent, int channels, int sugRate, const DivConfig& flags);
     void quit();
     DivPlatformPWM32X():
-      chan(NULL), isMuted(NULL), chans(0), oscBuf(NULL), cycle(1047), lastL(0), lastR(0) {}
+      chan(NULL), isMuted(NULL), chans(0), oscBuf(NULL), cycle(1047), lmode(1), rmode(1), lastL(0), lastR(0), dcIn{0,0}, dcOut{0,0} {}
 };
 
 #endif

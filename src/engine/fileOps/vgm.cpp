@@ -2561,7 +2561,9 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong* 
     int pwmEmpty=0;
     if (log.hasPWM) {
       const int cyc=std::max(3,log.pwmCycle);
-      const double mid=(double)cyc*0.5;
+      // (a pulse is cycle-1 clocks long, as Furnace's 32X PWM does it: the
+      // middle of that is silence)
+      const double mid=(double)(cyc-1)*0.5;
       // (val: both outputs together, what the hits are found on; l and r:
       // each one)
       struct PWMFrame {
@@ -2663,6 +2665,8 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong* 
         if (h.rate>96000.0) h.rate=96000.0;
         h.end=fr[e-1].time+44100.0/h.rate;
         auto toSample=[&](int val) -> short {
+          // (a width past a whole pulse is a whole pulse)
+          val=std::max(0,std::min(cyc-1,val));
           double v=((double)val-mid)*32767.0/mid;
           if (v<-32768.0) v=-32768.0;
           if (v>32767.0) v=32767.0;
@@ -8320,6 +8324,9 @@ bool DivEngine::loadVGM(unsigned char* file, size_t len) {
     std::vector<std::pair<size_t,size_t>> pwmBankBlocks;
     std::vector<VGMPWMWrite> pwmW;
     int pwmCycle=0;
+    // (the control register: its output modes, LMD/RMD, as the music plays
+    // them: the last one written before the first value, else the last one)
+    int pwmCtrl=-1, pwmCtrlAtStart=-1;
     int pwmCompressed=0;
     std::vector<VGMDecompTable> decompTables;
     // (channel 3's special mode, register $27 bits 6-7 = 01, with FM 3
@@ -8569,9 +8576,12 @@ bool DivEngine::loadVGM(unsigned char* file, size_t len) {
             if (pos+2<b.size() && usePWM) {
               int reg=b[pos+1]>>4;
               int val=((b[pos+1]&15)<<8)|b[pos+2];
-              if (reg==1) {
+              if (reg==0) {
+                pwmCtrl=val;
+              } else if (reg==1) {
                 pwmCycle=val;
               } else if (reg>=2 && reg<=4) {
+                if (pwmCtrlAtStart<0 && pwmW.empty()) pwmCtrlAtStart=pwmCtrl;
                 VGMPWMWrite w;
                 w.time=now;
                 w.ch=reg-2;
@@ -8996,7 +9006,7 @@ bool DivEngine::loadVGM(unsigned char* file, size_t len) {
     bool pwmStereo=false;
     int pwmSys=-1;
     if (pwmUsed) {
-      const double mid=(double)((pwmCycle>2)?pwmCycle:1047)*0.5;
+      const double mid=(double)(((pwmCycle>2)?pwmCycle:1047)-1)*0.5;
       double curL=mid, curR=mid, side=0, both=0;
       for (size_t i=0; i<pwmW.size(); i++) {
         const VGMPWMWrite& w=pwmW[i];
@@ -9022,7 +9032,15 @@ bool DivEngine::loadVGM(unsigned char* file, size_t len) {
       ds.system[pwmSys]=DIV_SYSTEM_PWM_32X;
       const double pwmClk=(double)(pwmClockRaw&0x3fffffff);
       ds.systemFlags[pwmSys].set("clockSel",(fabs(pwmClk-22801467.0)<fabs(pwmClk-23011361.0))?1:0);
-      ds.systemFlags[pwmSys].set("cycle",(pwmCycle>2)?std::max(256,std::min(4095,pwmCycle)):1047);
+      ds.systemFlags[pwmSys].set("cycle",(pwmCycle>2)?std::max(128,std::min(4095,pwmCycle)):1047);
+      {
+        // (written as 0 by a file that never sets them: then both normal)
+        int ctrl=(pwmCtrlAtStart>=0)?pwmCtrlAtStart:pwmCtrl;
+        if (ctrl<0 || (ctrl&15)==0) ctrl=0x05;
+        ds.systemFlags[pwmSys].set("lmode",ctrl&3);
+        ds.systemFlags[pwmSys].set("rmode",(ctrl>>2)&3);
+        if ((ctrl&15)!=0x05) logI("VGM import: PWM output modes LMD %d, RMD %d",ctrl&3,(ctrl>>2)&3);
+      }
       ds.systemLen++;
     }
     // the RF5C68/RF5C164 (Sega CD PCM): after the other chips

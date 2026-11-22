@@ -2083,6 +2083,9 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
       supportsCustomRate=false;
       int clockSel=flags.getInt("clockSel",0);
       int cycle=flags.getInt("cycle",1047);
+      int lmode=flags.getInt("lmode",1)&3;
+      int rmode=flags.getInt("rmode",1)&3;
+      static const char* pwmModes[4]={_N("off"),_N("own channel"),_N("other channel"),_N("off (not allowed)")};
 
       ImGui::Text(_("Clock rate:"));
       ImGui::Indent();
@@ -2096,20 +2099,42 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
       }
       ImGui::Unindent();
       ImGui::Text(_("Cycle register:"));
-      if (CWSliderInt("##PWMCycle",&cycle,256,4095)) {
-        if (cycle<256) cycle=256;
+      if (CWSliderInt("##PWMCycle",&cycle,128,4095)) {
+        if (cycle<128) cycle=128;
         if (cycle>4095) cycle=4095;
         altered=true;
       } rightClickable
       {
         const double clk=(clockSel==1)?22801467.0:23011361.0;
-        ImGui::Text(_("rate: %.0f Hz, %d levels"),clk/(double)(cycle-1),cycle+1);
+        ImGui::Text(_("rate: %.0f Hz, %d levels"),clk/(double)(cycle-1),cycle);
+      }
+      ImGui::Text(_("Left output (LMD):"));
+      if (ImGui::BeginCombo("##PWMLMD",_(pwmModes[lmode]))) {
+        for (int i=0; i<4; i++) {
+          if (ImGui::Selectable(_(pwmModes[i]),lmode==i)) {
+            lmode=i;
+            altered=true;
+          }
+        }
+        ImGui::EndCombo();
+      }
+      ImGui::Text(_("Right output (RMD):"));
+      if (ImGui::BeginCombo("##PWMRMD",_(pwmModes[rmode]))) {
+        for (int i=0; i<4; i++) {
+          if (ImGui::Selectable(_(pwmModes[i]),rmode==i)) {
+            rmode=i;
+            altered=true;
+          }
+        }
+        ImGui::EndCombo();
       }
 
       if (altered) {
         e->lockSave([&]() {
           flags.set("clockSel",clockSel);
           flags.set("cycle",cycle);
+          flags.set("lmode",lmode);
+          flags.set("rmode",rmode);
         });
       }
       break;
