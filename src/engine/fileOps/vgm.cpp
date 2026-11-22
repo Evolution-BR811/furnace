@@ -2448,14 +2448,26 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong* 
         }
         addStream(segStart,j);
       };
-      // the usual spacing of the writes around a place (median of W gaps)
+      // the usual spacing of the writes around a place: the average of W
+      // gaps, leaving out the driver's pauses (more than 2.5 times the
+      // median). (the median alone is too coarse: the writes' times are whole
+      // samples of the log, so 12 kHz and 23 kHz both look like 3 and 2)
       const size_t W=24;
-      std::vector<double> win(W);
+      std::vector<double> win(W), winS(W);
       auto medGap=[&](size_t from) -> double {
         // gaps from..from+W-1 (between writes from-1..from+W-1)
         for (size_t k=0; k<W; k++) win[k]=dw[from+k].time-dw[from+k-1].time;
-        std::nth_element(win.begin(),win.begin()+W/2,win.end());
-        return win[W/2];
+        winS=win;
+        std::nth_element(winS.begin(),winS.begin()+W/2,winS.end());
+        const double lim=winS[W/2]*2.5+0.5;
+        double sum=0;
+        int n=0;
+        for (double g: win) {
+          if (g>lim) continue;
+          sum+=g;
+          n++;
+        }
+        return (n>0)?(sum/(double)n):winS[W/2];
       };
       // a jump in the bank to a place where samples start is a new sample if
       // it starts like a sample does: loud, or much louder than what played
@@ -6936,7 +6948,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong* 
       std::stable_sort(byLen.begin(),byLen.end(),[&](int x, int y) {
         return hits[x].data.size()>hits[y].data.size();
       });
-      int reused=0;
+      int reused=0, leakRejected=0;
       for (int hi: byLen) {
         DACHit& h=hits[hi];
         const size_t hl=h.data.size();
@@ -7023,6 +7035,22 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong* 
               }
               if (bestShift<0) continue;
               sum=bestShift;
+              // the hit is the start of a longer sample, which then gets cut
+              // where the hit ended (ECxx). the cut can only happen at a tick,
+              // so up to a tick more of the sample plays: if what comes there
+              // is another sound starting (an attack, much louder than the
+              // hit's end), it would be heard (a second hit), so the hit
+              // takes a sample of its own
+              if (sm.data.size()>hl+16) {
+                const size_t leakN=(size_t)ceil(period*h.rate/44100.0)+8;
+                int tailMax=0, leakMax=0;
+                for (size_t k=(hl>72)?(hl-72):0; k+8<hl; k++) tailMax=std::max(tailMax,abs((int)h.data[k]));
+                for (size_t k=hl+8; k<hl+leakN && k<sm.data.size(); k++) leakMax=std::max(leakMax,abs((int)sm.data[k]));
+                if (leakMax>std::max(24,tailMax*2)) {
+                  leakRejected++;
+                  continue;
+                }
+              }
             }
           } else {
             // values taken from the timing of the writes move a little: the
@@ -7183,7 +7211,7 @@ bool vgmConvertNES(VGMNESLog& log, VGMNESContext& ctx, DivSong& ds, DivSubSong* 
         }
         if (fineFx>0) logI("VGM import: %d fine tunes on FM 6 for the DAC notes",fineFx);
       }
-      logI("VGM import: %d DAC hits, %d samples (%d hits reuse a longer or almost equal one, %d cuts)",(int)hits.size(),(int)smps.size(),reused,cuts);
+      logI("VGM import: %d DAC hits, %d samples (%d hits reuse a longer or almost equal one, %d cuts, %d times a longer one was passed over: its next sound would leak past the cut)",(int)hits.size(),(int)smps.size(),reused,cuts,leakRejected);
       if (moved>0) logI("VGM import: %d DAC samples started in the same row as another one and went to the next row",moved);
       if (merged>0) logI("VGM import: %d DAC samples started in the same row as another one and were joined to it",merged);
       if (dropped>0) warns.push_back(fmt::sprintf("%d DAC samples landed on the same row as an FM 6 note and were left out",dropped));
