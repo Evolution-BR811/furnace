@@ -793,6 +793,7 @@ src/engine/fileOps/ftm.cpp
 src/engine/fileOps/fur.cpp
 src/engine/fileOps/it.cpp
 src/engine/fileOps/midi.cpp
+src/engine/fileOps/gsf.cpp
 src/engine/fileOps/mod.cpp
 src/engine/fileOps/s3m.cpp
 src/engine/fileOps/text.cpp

@@ -1138,6 +1138,7 @@ class DivEngine {
   bool loadSID(unsigned char* file, size_t len);
   bool loadSPC(unsigned char* file, size_t len);
   bool loadGBS(unsigned char* file, size_t len);
+  bool loadGSF(unsigned char* file, size_t len, const char* path);
 
   /**
    * these functions load various instrument formats.

@@ -59,6 +59,10 @@ bool DivEngine::load(unsigned char* f, size_t slen, const char* nameHint) {
   if (memcmp(f,"PSID",4)==0 || memcmp(f,"RSID",4)==0) {
     return loadSID(f,slen);
   }
+  // GSF/MiniGSF: a Game Boy Advance game's music (MP2K driver)
+  if (slen>=16 && memcmp(f,"PSF\x22",4)==0) {
+    return loadGSF(f,slen,nameHint);
+  }
   // GBS: the sound program of a Game Boy game, played and converted
   if (slen>=0x71 && memcmp(f,"GBS\x01",4)==0) {
     return loadGBS(f,slen);

@@ -793,10 +793,14 @@ void DivEngine::processRow(int i, bool afterDelay) {
   // has no envelope to release, and MIDI imports (OpenMPT) write "===" for
   // every note off
   // (a channel playing a sample instrument counts too, e.g. a DAC/PCM mode)
+  // but an instrument with a volume envelope (macro) releases it as usual:
+  // its fade is the note's end (e.g. GSF imports)
   bool relIsOff=false;
   if (pat->newData[whatRow][DIV_PAT_NOTE]==DIV_NOTE_REL) {
+    DivInstrument* li=(chan[i].lastIns>=0 && chan[i].lastIns<(int)song.ins.size())?song.ins[chan[i].lastIns]:NULL;
     if (getChannelType(i)==DIV_CH_PCM) relIsOff=true;
-    if (chan[i].lastIns>=0 && chan[i].lastIns<(int)song.ins.size() && song.ins[chan[i].lastIns]->type==DIV_INS_AMIGA) relIsOff=true;
+    if (li!=NULL && li->type==DIV_INS_AMIGA) relIsOff=true;
+    if (li!=NULL && li->std.volMacro.len>0) relIsOff=false;
   }
   if (pat->newData[whatRow][DIV_PAT_NOTE]==DIV_NOTE_OFF || relIsOff) { // note off
     chan[i].keyOn=false;

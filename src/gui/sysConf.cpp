@@ -443,6 +443,7 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
       int dacDepth=flags.getInt("dacDepth",9);
       int channels=flags.getInt("channels",16);
       int sampRate=flags.getInt("sampRate",21845);
+      bool hqMix=flags.getBool("hqMix",false);
       ImGui::Text(_("Volume scale:"));
       if (CWSliderInt("##VolScale",&volScale,0,32768)) {
         if (volScale<0) volScale=0;
@@ -473,6 +474,12 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
         if (sampRate>65536) sampRate=65536;
         altered=true;
       } rightClickable
+      if (ImGui::Checkbox(_("High quality mix (no 8-bit rounding)"),&hqMix)) {
+        altered=true;
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(_("the real driver adds each channel in 8 bits, which makes quiet notes grainy.\nthis mixes at full precision instead."));
+      }
       if (chan>=0) {
         DivPlatformGBAMinMod* dispatch=(DivPlatformGBAMinMod*)e->getDispatch(chan);
         if (dispatch!=NULL) {
@@ -491,6 +498,7 @@ bool FurnaceGUI::drawSysConf(int chan, int sysPos, DivSystem type, DivConfig& fl
           flags.set("dacDepth",dacDepth);
           flags.set("channels",channels);
           flags.set("sampRate",sampRate);
+          flags.set("hqMix",hqMix);
         });
       }
       break;

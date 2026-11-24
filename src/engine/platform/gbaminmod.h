@@ -70,6 +70,9 @@ class DivPlatformGBAMinMod: public DivDispatch {
   unsigned int sampsRendered;
   signed char mixBuf[15*2][1024];
   unsigned char mixOut[2][4];
+  // (full precision mix, without the 8-bit sum of each channel)
+  int hqOut[2][4];
+  bool hqMix;
   short oscOut[16][4];
   int chanOut[16][2];
   size_t mixBufPage;
