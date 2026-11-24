@@ -1931,6 +1931,10 @@ int DivEngine::calcFreq(int base, int pitch, int arp, bool arpFixed, bool period
       return bf;
     }
   }
+  // linearidade parcial (legado): nota/slides no registrador, vibrato e E5xx multiplicativos
+  if (song.compatFlags.partialPitch) {
+    return DivPitchTable::legacyPartialFreq(base,pitch,pitch2,period);
+  }
   // non-linear pitch
   return period?
            base-pitch-pitch2:
@@ -2209,7 +2213,8 @@ void DivEngine::reset() {
       chan[i].volMax=(disCont[song.dispatchOfChan[i]].dispatch->dispatch(DivCommand(DIV_CMD_GET_VOLMAX,song.dispatchChanOfChan[i]))<<8)|0xff;
     }
     chan[i].volume=chan[i].volMax;
-    if (!song.compatFlags.linearPitch) chan[i].vibratoFine=4;
+    // na linearidade parcial (legado) o vibrato usa a escala fina normal, como no Furnace antigo
+    if (!song.compatFlags.linearPitch && !song.compatFlags.partialPitch) chan[i].vibratoFine=4;
     chan[i].arpSpeed=MAX(1,curSubSong->arpLen);
   }
   extValue=0;

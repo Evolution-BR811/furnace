@@ -46,6 +46,32 @@ bool DivEngine::load(unsigned char* f, size_t slen, const char* nameHint) {
     }
   }
 
+  // step 0.5: VGM/VGZ (VGZ is gzip, not zlib, so it is handled by the VGM loader)
+  if (memcmp(f,"Vgm ",4)==0 || (f[0]==0x1f && f[1]==0x8b && (extS==".vgz" || extS==".vgm"))) {
+    return loadVGM(f,slen);
+  }
+
+  // NSF/NSFe: the sound program of a game, played and converted
+  if (memcmp(f,"NESM\x1a",5)==0 || memcmp(f,"NSFE",4)==0) {
+    return loadNSF(f,slen);
+  }
+  // SID: C64 music, played and converted the same way
+  if (memcmp(f,"PSID",4)==0 || memcmp(f,"RSID",4)==0) {
+    return loadSID(f,slen);
+  }
+  // GSF/MiniGSF: a Game Boy Advance game's music (MP2K driver)
+  if (slen>=16 && memcmp(f,"PSF\x22",4)==0) {
+    return loadGSF(f,slen,nameHint);
+  }
+  // GBS: the sound program of a Game Boy game, played and converted
+  if (slen>=0x71 && memcmp(f,"GBS\x01",4)==0) {
+    return loadGBS(f,slen);
+  }
+  // SPC: the SNES's sound chip, its driver played and converted too
+  if (slen>=33 && memcmp(f,"SNES-SPC700 Sound File Data",27)==0) {
+    return loadSPC(f,slen);
+  }
+
   // step 1: try loading as a zlib-compressed file
   logD("trying zlib...");
   try {

@@ -72,6 +72,8 @@ void DivPlatformGBAMinMod::acquire(short** buf, size_t len) {
         for (size_t j=mixBufOffset; j<4; j++) {
           mixOut[0][j]=0;
           mixOut[1][j]=0;
+          hqOut[0][j]=0;
+          hqOut[1][j]=0;
         }
         for (int i=0; i<chanMax; i++) {
           for (size_t j=mixBufOffset; j<4; j++) {
@@ -113,6 +115,8 @@ void DivPlatformGBAMinMod::acquire(short** buf, size_t len) {
             int outA=(chan[i].invertL==chan[i].invertR)?outL+outR:outL-outR;
             mixOut[0][j]+=(unsigned char)(outL>>15);
             mixOut[1][j]+=(unsigned char)(outR>>15);
+            hqOut[0][j]+=outL;
+            hqOut[1][j]+=outR;
             oscOut[i][j]=volScale>0?outA*64/volScale:0;
           }
         }
@@ -129,8 +133,13 @@ void DivPlatformGBAMinMod::acquire(short** buf, size_t len) {
     }
     if (newSamp) {
       // assuming max PCM FIFO volume
-      sampL=((short)mixOut[0][sampPos]<<8)&(0xff80<<(9-dacDepth));
-      sampR=((short)mixOut[1][sampPos]<<8)&(0xff80<<(9-dacDepth));
+      if (hqMix) {
+        sampL=CLAMP(hqOut[0][sampPos]>>7,-32768,32767);
+        sampR=CLAMP(hqOut[1][sampPos]>>7,-32768,32767);
+      } else {
+        sampL=((short)mixOut[0][sampPos]<<8)&(0xff80<<(9-dacDepth));
+        sampR=((short)mixOut[1][sampPos]<<8)&(0xff80<<(9-dacDepth));
+      }
       newSamp=false;
     }
     buf[0][h]=sampL;
@@ -605,6 +614,7 @@ void DivPlatformGBAMinMod::resetMixer() {
   updTimer=0;
   updCycles=0;
   mixBufReadPos=0;
+  memset(hqOut,0,sizeof(hqOut));
   mixBufWritePos=0;
   mixBufPage=0;
   mixBufOffset=0;
@@ -745,6 +755,8 @@ void DivPlatformGBAMinMod::renderSamples(int sysID) {
 
 void DivPlatformGBAMinMod::setFlags(const DivConfig& flags) {
   volScale=flags.getInt("volScale",4096);
+  // (off: each channel is added in 8 bits, as the real driver does)
+  hqMix=flags.getBool("hqMix",false);
   mixBufs=flags.getInt("mixBufs",15);
   dacDepth=flags.getInt("dacDepth",9);
   chanMax=flags.getInt("channels",16);

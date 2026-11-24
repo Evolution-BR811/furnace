@@ -40,6 +40,24 @@ class DivPlatformRF5C68: public DivDispatch {
       macroVolMul(64) {}
   };
   Channel chan[8];
+  // streaming: each channel has a ring buffer of its own in the chip's
+  // memory, which is filled from the whole sample as the channel plays it
+  // (like the Sega CD's drivers do), so samples don't need to fit in 64 KB
+  struct Stream {
+    bool on;
+    int sample;
+    unsigned int srcPos;
+    unsigned int wpos;
+    Stream():
+      on(false),
+      sample(-1),
+      srcPos(0),
+      wpos(0) {}
+  };
+  Stream stream[8];
+  bool streaming;
+  void streamFeed(int ch, unsigned int count);
+  void streamRefill();
   DivDispatchOscBuffer* oscBuf[8];
   bool isMuted[8];
   DivPitchTableManager samplePitchTable;

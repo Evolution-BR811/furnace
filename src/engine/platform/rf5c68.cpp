@@ -26,6 +26,11 @@
 
 #define CHIP_FREQBASE 786432
 
+// streaming: channel i's ring buffer starts at i*0x2000; it holds
+// STREAM_LEN bytes, then end markers (the channel loops back to its start)
+#define STREAM_BASE(i) ((unsigned int)(i)<<13)
+#define STREAM_LEN 0x1ff8
+
 const char* regCheatSheetRF5C68[]={
   "Volume", "0",
   "Panning", "1",
@@ -54,6 +59,49 @@ void DivPlatformRF5C68::chWrite(unsigned char ch, unsigned int addr, unsigned ch
   }
 }
 
+// the next bytes of a channel's sample into its ring buffer
+void DivPlatformRF5C68::streamFeed(int ch, unsigned int count) {
+  Stream& st=stream[ch];
+  DivSample* s=(st.sample>=0 && st.sample<parent->song.sampleLen)?parent->getSample(st.sample):NULL;
+  int end=0;
+  bool loop=false;
+  int loopStart=0;
+  if (s!=NULL && s->data8!=NULL) {
+    end=s->getLoopEndPosition(DIV_SAMPLE_DEPTH_8BIT);
+    if (end>(int)s->samples) end=s->samples;
+    loop=s->isLoopable();
+    loopStart=s->loopStart;
+    if (loopStart<0 || loopStart>=end) loop=false;
+  }
+  for (unsigned int k=0; k<count; k++) {
+    unsigned char b=0;
+    if (s!=NULL && (int)st.srcPos>=end && loop) st.srcPos=loopStart;
+    if (s!=NULL && (int)st.srcPos<end) {
+      // (signed and magnitude, never an end marker)
+      signed char val=s->data8[st.srcPos++];
+      CLAMP_VAR(val,-127,126);
+      b=(val>0)?(val|0x80):(0-val);
+    }
+    sampleMem[STREAM_BASE(ch)+st.wpos]=b;
+    st.wpos++;
+    if (st.wpos>=STREAM_LEN) st.wpos=0;
+  }
+}
+
+// fill each playing channel's ring buffer up to where it reads
+void DivPlatformRF5C68::streamRefill() {
+  for (int i=0; i<8; i++) {
+    Stream& st=stream[i];
+    if (!st.on) continue;
+    int r=(int)((rf5c68.get_addr(i)>>11)&0xffff)-(int)STREAM_BASE(i);
+    if (r<0 || r>=STREAM_LEN) r=0;
+    // (everything up to the byte before the one it reads)
+    int fr=(r-1-(int)st.wpos)%STREAM_LEN;
+    if (fr<0) fr+=STREAM_LEN;
+    if (fr>0) streamFeed(i,fr);
+  }
+}
+
 // TODO: this code is weird
 //       make sure newDispatch didn't break it up
 void DivPlatformRF5C68::acquire(short** buf, size_t len) {
@@ -74,7 +122,10 @@ void DivPlatformRF5C68::acquire(short** buf, size_t len) {
 
   size_t lenCopy=len;
   while (lenCopy > 0) {
-    size_t blockLen=MIN(lenCopy,256);
+    // (streaming: short blocks, so a channel never reads past what is in
+    // its ring buffer: at most 32 bytes per output)
+    size_t blockLen=MIN(lenCopy,streaming?(size_t)64:(size_t)256);
+    if (streaming) streamRefill();
     short* bufPtrs[2]={&buf[0][pos],&buf[1][pos]};
     rf5c68.sound_stream_update(bufPtrs,chBufPtrs,blockLen);
     for (int i=0; i<8; i++) {
@@ -151,15 +202,26 @@ void DivPlatformRF5C68::tick(bool sysTick) {
       if (chan[i].keyOn) {
         unsigned int start=0;
         unsigned int loop=0;
-        if (chan[i].sample>=0 && chan[i].sample<parent->song.sampleLen) {
-          start=sampleOffRFC[chan[i].sample];
-          loop=start+s->length8;
-        }
-        if (chan[i].audPos>0) {
-          start=start+MIN(chan[i].audPos,s->length8);
-        }
-        if (s->isLoopable()) {
-          loop=start+s->loopStart;
+        if (streaming) {
+          // the channel's ring buffer, full from the start of the sample
+          start=STREAM_BASE(i);
+          loop=STREAM_BASE(i);
+          stream[i].on=true;
+          stream[i].sample=chan[i].sample;
+          stream[i].srcPos=(chan[i].audPos>0)?chan[i].audPos:0;
+          stream[i].wpos=0;
+          streamFeed(i,STREAM_LEN-1);
+        } else {
+          if (chan[i].sample>=0 && chan[i].sample<parent->song.sampleLen) {
+            start=sampleOffRFC[chan[i].sample];
+            loop=start+s->length8;
+          }
+          if (chan[i].audPos>0) {
+            start=start+MIN(chan[i].audPos,s->length8);
+          }
+          if (s->isLoopable()) {
+            loop=start+s->loopStart;
+          }
         }
         start=MIN(start,getSampleMemCapacity()-32);
         loop=MIN(loop,getSampleMemCapacity()-32);
@@ -175,6 +237,7 @@ void DivPlatformRF5C68::tick(bool sysTick) {
         chan[i].keyOn=false;
       }
       if (chan[i].keyOff) {
+        stream[i].on=false;
         rWrite(8,keyoff);
         chan[i].keyOff=false;
       }
@@ -350,6 +413,7 @@ void DivPlatformRF5C68::softReset() {
 
 void DivPlatformRF5C68::reset() {
   memset(regPool,0,144);
+  for (int i=0; i<8; i++) stream[i]=Stream();
   rf5c68.device_reset();
   rWrite(0x08,0xff); // keyoff all channels
   for (int i=0; i<8; i++) {
@@ -402,6 +466,7 @@ void DivPlatformRF5C68::setFlags(const DivConfig& flags) {
   }
   CHECK_CUSTOM_CLOCK;
   chipType=flags.getInt("chipType",0);
+  streaming=flags.getBool("streaming",false);
   rate=chipClock/384;
   for (int i=0; i<8; i++) {
     oscBuf[i]->setRate(rate);
@@ -458,6 +523,20 @@ void DivPlatformRF5C68::renderSamples(int sysID) {
 
   memCompo=DivMemoryComposition();
   memCompo.name="Sample Memory";
+
+  if (streaming) {
+    // a ring buffer per channel (end markers after each), and every sample
+    // plays from the song itself
+    for (int i=0; i<8; i++) {
+      memset(&sampleMem[STREAM_BASE(i)+STREAM_LEN],0xff,0x2000-STREAM_LEN);
+      memCompo.entries.push_back(DivMemoryEntry(DIV_MEMORY_RESERVED,fmt::sprintf("Channel %d stream",i+1),-1,STREAM_BASE(i),STREAM_BASE(i)+0x2000));
+    }
+    for (int i=0; i<parent->song.sampleLen && i<32768; i++) sampleLoaded[i]=true;
+    sampleMemLen=getSampleMemCapacity();
+    memCompo.used=sampleMemLen;
+    memCompo.capacity=getSampleMemCapacity(0);
+    return;
+  }
 
   size_t memPos=0;
   for (int i=0; i<parent->song.sampleLen; i++) {
@@ -525,6 +604,7 @@ void DivPlatformRF5C68::quit() {
 DivPlatformRF5C68::DivPlatformRF5C68() {
   sampleOffRFC=new unsigned int[32768];
   sampleLoaded=new bool[32768];
+  streaming=false;
 }
 
 DivPlatformRF5C68::~DivPlatformRF5C68() {

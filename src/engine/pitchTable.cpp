@@ -18,6 +18,7 @@
  */
 
 #include "dispatch.h"
+#include <math.h>
 #include "engine.h"
 
 // DivPitchTableManager
@@ -68,10 +69,43 @@ DivPitchTableManager::~DivPitchTableManager() {
 
 // DivPitchTable
 
+// linearidade parcial (legado). ver dispatch.h.
+bool DivPitchTable::legacyPartial=false;
+bool DivPitchTable::legacyPitchMacroLinear=true;
+
+static int legacyPitchTab[4096];
+static int legacyRevPitchTab[4096];
+static bool legacyTabsReady=false;
+
+int DivPitchTable::legacyPartialFreq(int base, int pitch, int pitch2, bool period) {
+  // mesmas tabelas e a mesma conta do Furnace 0.6.8.x (DivEngine::calcFreq com linearPitch==1)
+  if (!legacyTabsReady) {
+    for (int i=0; i<4096; i++) {
+      legacyRevPitchTab[i]=round(1024.0*pow(2.0,(2048.0-(double)i)/(12.0*128.0)));
+      legacyPitchTab[i]=round(1024.0*pow(2.0,((double)i-2048.0)/(12.0*128.0)));
+    }
+    legacyTabsReady=true;
+  }
+  if (legacyPitchMacroLinear) pitch+=pitch2;
+  pitch+=2048;
+  if (pitch<0) pitch=0;
+  if (pitch>4095) pitch=4095;
+  int ret=period?
+    ((base*legacyRevPitchTab[pitch])>>10):
+    ((base*legacyPitchTab[pitch])>>10);
+  if (!legacyPitchMacroLinear) {
+    ret+=period?(-pitch2):pitch2;
+  }
+  return ret;
+}
+
 int DivPitchTable::get(int base, int pitch1, int pitch2) {
   int offset=base+pitch1+pitch2;
 
   if (!linearity) {
+    if (legacyPartial) {
+      return legacyPartialFreq(base,pitch1,pitch2,period);
+    }
     if (period) {
       return base-pitch1-pitch2;
     }

@@ -2452,6 +2452,13 @@ void DivEngine::registerSystems() {
     }
   );
 
+  sysDefs[DIV_SYSTEM_PWM_32X]=new DivSysDef(
+    _("Sega 32X PWM"), NULL, 0x32a, 0, 8, 1, 16,
+    false, true, 0, false, (1U<<DIV_SAMPLE_DEPTH_16BIT)|(1U<<DIV_SAMPLE_DEPTH_8BIT), 0, 0,
+    _("the sound of the Sega 32X: two pulse width outputs (left and right), with a rate and a resolution set by the cycle register (22 kHz and about 10 bits at its usual value), its output modes (each side can play its own channel, the other one or nothing) and the board's DC removal. it has no channels of its own: games mixed them on its SH2 processor, which is what these channels do (samples without interpolation, a volume and panning each, summed into whole pulse widths)."),
+    DivChanDefFunc(stockChanDef<DIV_CH_PCM,DIV_INS_AMIGA>)
+  );
+
   sysDefs[DIV_SYSTEM_K007232]=new DivSysDef(
     _("Konami K007232"), NULL, 0xc6, 0, 2, 2, 2,
     false, true, 0, false, 1U<<DIV_SAMPLE_DEPTH_8BIT, 0, 0,
@@ -2522,6 +2529,38 @@ void DivEngine::registerSystems() {
     }),
     {
       {0x20, {DIV_CMD_STD_NOISE_MODE, _("20xx: Set waveform (0: Wave A; 1: Wave B; 2: noise /512; 3: noise /1024; 4: noise /2048; 5: noise linked to pitch; 6: noise /256; 7: noise /128)")}}
+    }
+  );
+
+  sysDefs[DIV_SYSTEM_BR1611]=new DivSysDef(
+    _("BR1611 (Ompreza 2)"), NULL, 0x1611, 0, 7, 7, 7,
+    false, true, 0, false, (1U<<DIV_SAMPLE_DEPTH_16BIT)|(1U<<DIV_SAMPLE_DEPTH_8BIT)|(1U<<DIV_SAMPLE_DEPTH_4BIT)|(1U<<DIV_SAMPLE_DEPTH_BRR), 256, 256,
+    _("the sound chip of the fictional Ompreza 2 console (1989), designed by Evolution BR811. 7 channels of WMS (Wave Modulation Synthesis): 4 operators per channel with the algorithms, feedback, envelopes and LFO of the OPN (YM2612), but each operator plays its own drawn waveform. channels 6 and 7 can also play 16-bit, 8-bit, 4-bit or CP (BRR-style ADPCM) samples from cartridge ROM."),
+    DivChanDefFunc({
+      DivChanDef(_("Channel 1"), "W1", DIV_CH_FM, DIV_INS_BR1611),
+      DivChanDef(_("Channel 2"), "W2", DIV_CH_FM, DIV_INS_BR1611),
+      DivChanDef(_("Channel 3"), "W3", DIV_CH_FM, DIV_INS_BR1611),
+      DivChanDef(_("Channel 4"), "W4", DIV_CH_FM, DIV_INS_BR1611),
+      DivChanDef(_("Channel 5"), "W5", DIV_CH_FM, DIV_INS_BR1611),
+      DivChanDef(_("Channel 6"), "W6", DIV_CH_PCM, DIV_INS_BR1611, DIV_INS_AMIGA),
+      DivChanDef(_("Channel 7"), "W7", DIV_CH_PCM, DIV_INS_BR1611, DIV_INS_AMIGA)
+    }),
+    {},
+    fmOPNPostEffectHandlerMap
+  );
+
+  sysDefs[DIV_SYSTEM_BR411]=new DivSysDef(
+    _("BR411 (Ompreza P)"), NULL, 0x0411, 0, 4, 4, 4,
+    false, true, 0, false, 0, 0, 0,
+    _("the sound chip of the fictional Ompreza P handheld (1988), designed by Evolution BR811. a cost-reduced BR811: 4 channels, each switching between Wave A and white noise with the same fixed rates. no Wave B and no PCM. its cheap /64 tuning prescaler makes high notes slightly out of tune on purpose. mono output."),
+    DivChanDefFunc({
+      DivChanDef(_("Channel 1"), "C1", DIV_CH_PULSE, DIV_INS_BR411),
+      DivChanDef(_("Channel 2"), "C2", DIV_CH_PULSE, DIV_INS_BR411),
+      DivChanDef(_("Channel 3"), "C3", DIV_CH_PULSE, DIV_INS_BR411),
+      DivChanDef(_("Channel 4"), "C4", DIV_CH_PULSE, DIV_INS_BR411)
+    }),
+    {
+      {0x20, {DIV_CMD_STD_NOISE_MODE, _("20xx: Set waveform (0: Wave A; 1: noise 12.5 kHz; 2: noise 6.25 kHz; 3: noise 3.125 kHz; 4: noise linked to pitch; 5: noise 25 kHz; 6: noise 50 kHz)")}}
     }
   );
 

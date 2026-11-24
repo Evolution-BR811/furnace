@@ -4,6 +4,7 @@
 
 #include "blargg_endian.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* Copyright (C) 2007 Shay Green. This module is free software; you
 can redistribute it and/or modify it under the terms of the GNU Lesser
@@ -505,12 +506,16 @@ inline void SPC_DSP::voice_output( voice_t* const v, int ch )
 	
 	// Add to output total
 	m.t_main_out [ch] += amp;
+	if ( m.t_main_out [ch] > peak_sum ) peak_sum = m.t_main_out [ch];
+	if ( -m.t_main_out [ch] > peak_sum ) peak_sum = -m.t_main_out [ch];
 	CLAMP16( m.t_main_out [ch] );
 	
 	// Optionally add to echo total
 	if ( m.t_eon & v->vbit )
 	{
 		m.t_echo_out [ch] += amp;
+		if ( m.t_echo_out [ch] > peak_sum ) peak_sum = m.t_echo_out [ch];
+		if ( -m.t_echo_out [ch] > peak_sum ) peak_sum = -m.t_echo_out [ch];
 		CLAMP16( m.t_echo_out [ch] );
 	}
 }
@@ -656,12 +661,16 @@ ECHO_CLOCK( 25 )
 	int l = m.t_echo_in [0] + CALC_FIR( 6, 0 );
 	int r = m.t_echo_in [1] + CALC_FIR( 6, 1 );
 	
+	if ( abs( l ) > peak_sum ) peak_sum = abs( l );
+	if ( abs( r ) > peak_sum ) peak_sum = abs( r );
 	l = (int16_t) l;
 	r = (int16_t) r;
 	
 	l += (int16_t) CALC_FIR( 7, 0 );
 	r += (int16_t) CALC_FIR( 7, 1 );
 	
+	if ( abs( l ) > peak_sum ) peak_sum = abs( l );
+	if ( abs( r ) > peak_sum ) peak_sum = abs( r );
 	CLAMP16( l );
 	CLAMP16( r );
 	
@@ -685,6 +694,8 @@ ECHO_CLOCK( 26 )
 	int l = m.t_echo_out [0] + (int16_t) ((m.t_echo_in [0] * (int8_t) REG(efb)) >> 7);
 	int r = m.t_echo_out [1] + (int16_t) ((m.t_echo_in [1] * (int8_t) REG(efb)) >> 7);
 	
+	if ( abs( l ) > peak_sum ) peak_sum = abs( l );
+	if ( abs( r ) > peak_sum ) peak_sum = abs( r );
 	CLAMP16( l );
 	CLAMP16( r );
 	

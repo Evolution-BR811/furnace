@@ -418,6 +418,8 @@ JSON serializeInstrument(DivInstrument* ins) {
     case DIV_INS_GBA_MINMOD:
     case DIV_INS_SUPERVISION:
     case DIV_INS_BR811:
+    case DIV_INS_BR1611:
+    case DIV_INS_BR411:
       featureSM=true;
       break;
     case DIV_INS_SM8521:
@@ -961,6 +963,7 @@ JSON serializeCompatFlags(DivCompatFlags* flags) {
 #define SET_FLAG(f) json[ #f ]=flags->f
   SET_FLAG(limitSlides);
   SET_FLAG(linearPitch);
+  SET_FLAG(partialPitch);
   SET_FLAG(pitchSlideSpeed);
   SET_FLAG(loopModality);
   SET_FLAG(delayBehavior);

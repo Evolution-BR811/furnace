@@ -2204,7 +2204,7 @@ void FurnaceGUI::openFileDialog(FurnaceGUIFileDialogs type) {
       if (!dirExists(workingDirSong)) workingDirSong=getHomeDir();
       hasOpened=fileDialog->openLoad(
         _("Open File"),
-        {_("compatible files"), "*.fur *.dmf *.mod *.s3m *.xm *.it *.fc13 *.fc14 *.smod *.fc *.ftm *.0cc *.dnm *.eft *.fub *.tfe *.mid *.midi *.kar *.smf",
+        {_("compatible files"), "*.fur *.dmf *.mod *.s3m *.xm *.it *.fc13 *.fc14 *.smod *.fc *.ftm *.0cc *.dnm *.eft *.fub *.tfe *.mid *.midi *.kar *.smf *.vgm *.vgz *.nsf *.nsfe *.sid *.spc *.gbs *.minigsf *.gsf",
          _("all files"), "*"},
         workingDirSong,
         dpiScale
@@ -2353,6 +2353,17 @@ void FurnaceGUI::openFileDialog(FurnaceGUIFileDialogs type) {
         (type==GUI_FILE_WAVE_OPEN)
       );
       break;
+    case GUI_FILE_BR1611_WAVE_OPEN:
+      if (!dirExists(workingDirWave)) workingDirWave=getHomeDir();
+      hasOpened=fileDialog->openLoad(
+        _("Load Wavetable"),
+        {_("compatible files"), "*.fuw *.dmw",
+         _("all files"), "*"},
+        workingDirWave,
+        dpiScale
+      );
+      break;
+    case GUI_FILE_BR1611_WAVE_SAVE:
     case GUI_FILE_WAVE_SAVE:
       if (!dirExists(workingDirWave)) workingDirWave=getHomeDir();
       hasOpened=fileDialog->openSave(
@@ -2950,6 +2961,19 @@ int FurnaceGUI::load(String path) {
       pendingMIDIPath=path;
       displayMIDIImport=true;
       return 0;
+    }
+    // an NSF holds every song of a game: ask which tracks to import first
+    if (!nsfImportPending && len>=5 && (memcmp(file,"NESM\x1a",5)==0 || memcmp(file,"NSFE",4)==0 || memcmp(file,"PSID",4)==0 || memcmp(file,"RSID",4)==0 || memcmp(file,"GBS\x01",4)==0)) {
+      DivNSFInfo info;
+      if (e->getNSFInfo(file,(size_t)len,info)) {
+        delete[] file;
+        nsfInfo=info;
+        pendingNSFPath=path;
+        nsfTrackSel.assign(info.songs,false);
+        if (info.start>=1 && info.start<=info.songs) nsfTrackSel[info.start-1]=true;
+        displayNSFImport=true;
+        return 0;
+      }
     }
     if (!e->load(file,(size_t)len,path.c_str())) {
       lastError=e->getLastError();
@@ -6079,6 +6103,8 @@ bool FurnaceGUI::loop() {
         case GUI_FILE_WAVE_SAVE_DMW:
         case GUI_FILE_WAVE_SAVE_RAW:
         case GUI_FILE_WAVE_SAVE_ALL:
+        case GUI_FILE_BR1611_WAVE_OPEN:
+        case GUI_FILE_BR1611_WAVE_SAVE:
           workingDirWave=fileDialog->getPath()+DIR_SEPARATOR_STR;
           break;
         case GUI_FILE_SAMPLE_OPEN:
@@ -6198,7 +6224,7 @@ bool FurnaceGUI::loop() {
           if (curFileDialog==GUI_FILE_INS_SAVE_DMP) {
             checkExtension(".dmp");
           }
-          if (curFileDialog==GUI_FILE_WAVE_SAVE) {
+          if (curFileDialog==GUI_FILE_WAVE_SAVE || curFileDialog==GUI_FILE_BR1611_WAVE_SAVE) {
             checkExtension(".fuw");
           }
           if (curFileDialog==GUI_FILE_WAVE_SAVE_DMW) {
@@ -6642,6 +6668,42 @@ bool FurnaceGUI::loop() {
               }
               break;
             }
+            case GUI_FILE_BR1611_WAVE_OPEN: {
+              // BR1611: a onda de um operador do instrumento
+              DivWavetable* wave=e->waveFromFile(copyOfName.c_str());
+              if (wave==NULL) {
+                showError(fmt::sprintf(_("cannot load wavetable! (%s)"),e->getLastError()));
+              } else {
+                if (br1611WaveIns>=0 && br1611WaveIns<(int)e->song.ins.size() && br1611WaveOp>=0 && br1611WaveOp<4) {
+                  DivInstrument* ins=e->song.ins[br1611WaveIns];
+                  int len=CLAMP(wave->len,1,256);
+                  int wmin=wave->min, wmax=wave->max;
+                  if (wmax<=wmin) wmax=wmin+1;
+                  e->lockEngine([ins,wave,len,wmin,wmax,this]() {
+                    ins->br1611.waveLen[br1611WaveOp]=len;
+                    for (int k=0; k<len; k++) {
+                      ins->br1611.waveData[br1611WaveOp][k]=(unsigned char)CLAMP((int)round((double)(wave->data[k]-wmin)*255.0/(double)(wmax-wmin)),0,255);
+                    }
+                  });
+                  e->notifyInsChange(br1611WaveIns);
+                  MARK_MODIFIED;
+                }
+                delete wave;
+              }
+              break;
+            }
+            case GUI_FILE_BR1611_WAVE_SAVE: {
+              if (br1611WaveIns>=0 && br1611WaveIns<(int)e->song.ins.size() && br1611WaveOp>=0 && br1611WaveOp<4) {
+                DivInstrument* ins=e->song.ins[br1611WaveIns];
+                DivWavetable w;
+                w.len=CLAMP(ins->br1611.waveLen[br1611WaveOp],1,256);
+                w.min=0;
+                w.max=255;
+                for (int k=0; k<w.len; k++) w.data[k]=ins->br1611.waveData[br1611WaveOp][k];
+                if (w.save(copyOfName.c_str())) pushRecentSys(copyOfName.c_str());
+              }
+              break;
+            }
             case GUI_FILE_WAVE_OPEN: {
               String errs=_("there were some errors while loading wavetables:\n");
               bool warn=false;
@@ -6998,6 +7060,11 @@ bool FurnaceGUI::loop() {
     if (displayMIDIImport) {
       displayMIDIImport=false;
       ImGui::OpenPopup(_("Import MIDI"));
+    }
+
+    if (displayNSFImport) {
+      displayNSFImport=false;
+      ImGui::OpenPopup(_("Import NSF"));
     }
 
     if (displayInsTypeList) {
@@ -8156,6 +8223,116 @@ bool FurnaceGUI::loop() {
           showError(fmt::sprintf(_("Error while loading file! (%s)"),lastError));
         }
       }
+      ImGui::EndPopup();
+    }
+
+    float nsfImportW=mobileUI?(canvasW-(portrait?0:(60.0*dpiScale))):(420.0f*dpiScale);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(nsfImportW,0.0f),ImVec2(nsfImportW,canvasH-(mobileUI?(60.0*dpiScale):0)));
+    if (ImGui::BeginPopupModal(_("Import NSF"),NULL,ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoScrollWithMouse|ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_AlwaysAutoResize)) {
+      ImGui::SetWindowPos(ImVec2(((canvasW)-ImGui::GetWindowSize().x)*0.5,((canvasH)-ImGui::GetWindowSize().y)*0.5));
+      ImGui::PushFont(headFont);
+      ImGui::TextWrapped("%s",nsfInfo.title.empty()?_("(untitled)"):nsfInfo.title.c_str());
+      ImGui::PopFont();
+      if (!nsfInfo.artist.empty()) ImGui::TextWrapped("%s",nsfInfo.artist.c_str());
+      if (!nsfInfo.copyright.empty()) ImGui::TextWrapped("%s",nsfInfo.copyright.c_str());
+      ImGui::Text(_("%d tracks, %s, %s"),nsfInfo.songs,nsfInfo.chips.c_str(),nsfInfo.pal?"PAL":"NTSC");
+      {
+        // (the VRC6 and the 5B are imported; the other expansions not yet)
+        String rest=nsfInfo.chips;
+        for (const char* ok: {" + VRC6"," + 5B"}) {
+          size_t p=rest.find(ok);
+          if (p!=String::npos) rest.erase(p,strlen(ok));
+        }
+        if (rest!="2A03" && nsfInfo.chips.find("SID")!=0) {
+          ImGui::TextWrapped(_("this NSF uses an expansion chip that can't be imported yet; only the 2A03, VRC6 and Sunsoft 5B parts are imported."));
+        }
+      }
+      ImGui::Separator();
+
+      if (ImGui::Checkbox(_("Import several tracks at once"),&nsfMultiTrack)) {
+        if (!nsfMultiTrack) {
+          // back to one track: keep only the first one picked
+          bool found=false;
+          for (size_t i=0; i<nsfTrackSel.size(); i++) {
+            if (nsfTrackSel[i] && !found) {
+              found=true;
+            } else {
+              nsfTrackSel[i]=false;
+            }
+          }
+        }
+      }
+      if (nsfMultiTrack) {
+        if (ImGui::Button(_("Select all"))) {
+          for (size_t i=0; i<nsfTrackSel.size(); i++) nsfTrackSel[i]=true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(_("Select none"))) {
+          for (size_t i=0; i<nsfTrackSel.size(); i++) nsfTrackSel[i]=false;
+        }
+      }
+      if (ImGui::BeginChild("NSFTrackList",ImVec2(0,260.0f*dpiScale),true)) {
+        for (int i=0; i<nsfInfo.songs && i<(int)nsfTrackSel.size(); i++) {
+          String label;
+          if (i<(int)nsfInfo.trackNames.size() && !nsfInfo.trackNames[i].empty()) {
+            label=fmt::sprintf("%d. %s",i+1,nsfInfo.trackNames[i]);
+          } else {
+            label=fmt::sprintf(_("Track %d"),i+1);
+          }
+          if (i<(int)nsfInfo.trackLengths.size() && nsfInfo.trackLengths[i]>0) {
+            int sec=nsfInfo.trackLengths[i]/1000;
+            label+=fmt::sprintf(" (%d:%.2d)",sec/60,sec%60);
+          }
+          if (i+1==nsfInfo.start) label+=_(" - starting track");
+          label+=fmt::sprintf("##NSFTrack%d",i);
+          if (nsfMultiTrack) {
+            bool sel=nsfTrackSel[i];
+            if (ImGui::Checkbox(label.c_str(),&sel)) nsfTrackSel[i]=sel;
+          } else {
+            if (ImGui::RadioButton(label.c_str(),(bool)nsfTrackSel[i])) {
+              for (size_t j=0; j<nsfTrackSel.size(); j++) nsfTrackSel[j]=(j==(size_t)i);
+            }
+          }
+        }
+      }
+      ImGui::EndChild();
+
+      ImGui::SetNextItemWidth(140.0f*dpiScale);
+      if (ImGui::InputInt(_("Maximum length (seconds)"),&e->nsfImportOptions.maxSeconds,10,60)) {
+        if (e->nsfImportOptions.maxSeconds<10) e->nsfImportOptions.maxSeconds=10;
+        if (e->nsfImportOptions.maxSeconds>1800) e->nsfImportOptions.maxSeconds=1800;
+      }
+      int selCount=0;
+      for (bool b: nsfTrackSel) if (b) selCount++;
+      if (nsfMultiTrack) {
+        ImGui::TextWrapped(_("each track is played until its loop is found (or until the maximum length) and becomes a subsong. all tracks share the 256 instruments of one song, so importing many at once may merge some rare ones."));
+      } else {
+        ImGui::TextWrapped(_("the track is played until its loop is found (or until the maximum length)."));
+      }
+
+      ImGui::Separator();
+      float nsfImportBtnW=(ImGui::GetContentRegionAvail().x-ImGui::GetStyle().ItemSpacing.x)*0.5f;
+      if (ImGui::Button(_("Cancel"),ImVec2(nsfImportBtnW,0)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SameLine();
+      ImGui::BeginDisabled(selCount==0);
+      if (ImGui::Button(_("Import"),ImVec2(nsfImportBtnW,0))) {
+        String path=pendingNSFPath;
+        e->nsfImportOptions.tracks.clear();
+        for (size_t i=0; i<nsfTrackSel.size(); i++) {
+          if (nsfTrackSel[i]) e->nsfImportOptions.tracks.push_back((int)i+1);
+        }
+        ImGui::CloseCurrentPopup();
+        nsfImportPending=true;
+        int result=load(path);
+        nsfImportPending=false;
+        e->nsfImportOptions.tracks.clear();
+        if (result>0) {
+          showError(fmt::sprintf(_("Error while loading file! (%s)"),lastError));
+        }
+      }
+      ImGui::EndDisabled();
       ImGui::EndPopup();
     }
 
@@ -9784,6 +9961,9 @@ FurnaceGUI::FurnaceGUI():
   pendingRawSampleReplace(false),
   displayMIDIImport(false),
   midiImportPending(false),
+  displayNSFImport(false),
+  nsfImportPending(false),
+  nsfMultiTrack(false),
   globalWinFlags(0),
   curFileDialog(GUI_FILE_OPEN),
   warnAction(GUI_WARN_OPEN),

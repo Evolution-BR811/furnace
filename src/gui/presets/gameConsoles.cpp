@@ -81,6 +81,20 @@ void initSystemPresetsGameConsoles(std::vector<FurnaceGUISysCategory>& sysCatego
         )
       }
     );
+    SUB_ENTRY(
+      _("Sega Genesis (with 32X)"), {
+        CH(DIV_SYSTEM_YM2612, 1.0f, 0, ""),
+        CH(DIV_SYSTEM_SMS, 0.5f, 0, ""),
+        CH(DIV_SYSTEM_PWM_32X, 1.0f, 0, "")
+      }
+    );
+    SUB_ENTRY(
+      _("Sega Genesis (extended channel 3 with 32X)"), {
+        CH(DIV_SYSTEM_YM2612_EXT, 1.0f, 0, ""),
+        CH(DIV_SYSTEM_SMS, 0.5f, 0, ""),
+        CH(DIV_SYSTEM_PWM_32X, 1.0f, 0, "")
+      }
+    );
   ENTRY(
     _("Sega Master System"), {
       CH(DIV_SYSTEM_SMS, 1.0f, 0, "")
